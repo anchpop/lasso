@@ -442,6 +442,8 @@ mod rodeo;
 pub use interface::{Interner, IntoReader, IntoReaderAndResolver, IntoResolver, Reader, Resolver};
 pub use keys::{Key, LargeSpur, MicroSpur, MiniSpur, Spur};
 pub use reader::RodeoReader;
+#[cfg(feature = "rkyv")]
+pub use reader::ArchivedRodeoReader;
 pub use resolver::RodeoResolver;
 pub use rodeo::Rodeo;
 pub use util::{Capacity, Iter, LassoError, LassoErrorKind, LassoResult, MemoryLimits, Strings};

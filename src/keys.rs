@@ -395,6 +395,48 @@ impl_abomonation! {
     LargeSpur,
 }
 
+macro_rules! impl_rkyv {
+    ($($key:ident),* $(,)?) => {
+        #[cfg(feature = "rkyv")]
+        mod __rkyv {
+            use super::{$($key),*};
+            use rkyv::{Archive, Deserialize, Serialize};
+
+            $(
+                impl Archive for $key {
+                    type Archived = Self;
+                    type Resolver = ();
+
+                    unsafe fn resolve(&self, _pos: usize, _resolver: Self::Resolver, out: *mut Self::Archived) {
+                        // Safety: We're writing a Copy type to the output location
+                        unsafe { out.write(*self) }
+                    }
+                }
+
+                impl<S: rkyv::ser::Serializer + ?Sized> Serialize<S> for $key {
+                    fn serialize(&self, _serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+                        Ok(())
+                    }
+                }
+
+                impl<D: rkyv::Fallible + ?Sized> Deserialize<$key, D> for $key {
+                    fn deserialize(&self, _deserializer: &mut D) -> Result<$key, D::Error> {
+                        Ok(*self)
+                    }
+                }
+            )*
+        }
+    };
+}
+
+// Implement rkyv support when the `rkyv` feature is enabled
+impl_rkyv! {
+    Spur,
+    MiniSpur,
+    MicroSpur,
+    LargeSpur,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +547,39 @@ mod tests {
 
         let micro = MicroSpur::try_from_usize(0).unwrap();
         let _ = serde_json::to_string(&micro).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "rkyv")]
+    fn all_rkyv_serialize() {
+        use rkyv::{archived_root, ser::{serializers::AllocSerializer, Serializer}};
+
+        let large = LargeSpur::try_from_usize(42).unwrap();
+        let mut serializer = AllocSerializer::<256>::default();
+        serializer.serialize_value(&large).unwrap();
+        let bytes = serializer.into_serializer().into_inner();
+        let archived = unsafe { archived_root::<LargeSpur>(&bytes) };
+        assert_eq!(archived.into_usize(), 42);
+
+        let normal = Spur::try_from_usize(42).unwrap();
+        let mut serializer = AllocSerializer::<256>::default();
+        serializer.serialize_value(&normal).unwrap();
+        let bytes = serializer.into_serializer().into_inner();
+        let archived = unsafe { archived_root::<Spur>(&bytes) };
+        assert_eq!(archived.into_usize(), 42);
+
+        let mini = MiniSpur::try_from_usize(42).unwrap();
+        let mut serializer = AllocSerializer::<256>::default();
+        serializer.serialize_value(&mini).unwrap();
+        let bytes = serializer.into_serializer().into_inner();
+        let archived = unsafe { archived_root::<MiniSpur>(&bytes) };
+        assert_eq!(archived.into_usize(), 42);
+
+        let micro = MicroSpur::try_from_usize(42).unwrap();
+        let mut serializer = AllocSerializer::<256>::default();
+        serializer.serialize_value(&micro).unwrap();
+        let bytes = serializer.into_serializer().into_inner();
+        let archived = unsafe { archived_root::<MicroSpur>(&bytes) };
+        assert_eq!(archived.into_usize(), 42);
     }
 }

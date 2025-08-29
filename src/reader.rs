@@ -475,6 +475,175 @@ impl<'de, K: Key, S: BuildHasher + Default> Deserialize<'de> for RodeoReader<K, 
     }
 }
 
+#[cfg(feature = "rkyv")]
+pub use rkyv_impl::ArchivedRodeoReader;
+
+#[cfg(feature = "rkyv")]
+mod rkyv_impl {
+    use super::*;
+    use crate::{Capacity, arenas::Arena};
+    use alloc::string::String;
+    use core::num::NonZeroUsize;
+    use hashbrown::hash_map::RawEntryMut;
+    use rkyv::{Archive, Deserialize, Serialize};
+
+    impl<K: Archive, S> Archive for RodeoReader<K, S>
+    where
+        K::Archived: Key,
+    {
+        type Archived = ArchivedRodeoReader<K::Archived>;
+        type Resolver = rkyv::vec::VecResolver;
+
+        unsafe fn resolve(&self, pos: usize, resolver: Self::Resolver, out: *mut Self::Archived) {
+            let (fp, fo) = rkyv::out_field!(out.strings);
+            let strings: Vec<String> = self.strings.iter().map(|s| s.to_string()).collect();
+            // Safety: We're resolving the strings field at the correct offset
+            unsafe { rkyv::vec::ArchivedVec::resolve_from_slice(strings.as_slice(), pos + fp, resolver, fo) }
+        }
+    }
+
+    impl<S: rkyv::ser::Serializer + rkyv::ser::ScratchSpace + ?Sized, K: Archive + Serialize<S>, H> Serialize<S> for RodeoReader<K, H> 
+    where
+        K::Archived: Key,
+    {
+        fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+            let strings: Vec<String> = self.strings.iter().map(|s| s.to_string()).collect();
+            rkyv::vec::ArchivedVec::serialize_from_slice(strings.as_slice(), serializer)
+        }
+    }
+
+    /// An archived version of RodeoReader that can be used to read interned strings
+    /// directly from serialized data without deserialization
+    #[derive(Debug)]
+    pub struct ArchivedRodeoReader<K> {
+        strings: rkyv::vec::ArchivedVec<rkyv::string::ArchivedString>,
+        _phantom: core::marker::PhantomData<K>,
+    }
+
+    impl<K: Key> ArchivedRodeoReader<K> {
+        /// Get the key for a string, returning `None` if it doesn't exist
+        pub fn get(&self, val: &str) -> Option<K> {
+            self.strings
+                .iter()
+                .position(|s| s.as_str() == val)
+                .and_then(K::try_from_usize)
+        }
+
+        /// Returns `true` if the given string has been interned
+        pub fn contains(&self, val: &str) -> bool {
+            self.get(val).is_some()
+        }
+
+        /// Returns `true` if the given key exists in the archived interner
+        pub fn contains_key(&self, key: &K) -> bool {
+            key.into_usize() < self.strings.len()
+        }
+
+        /// Resolves a string by its key, panics if the key is out of bounds
+        pub fn resolve<'a>(&'a self, key: &K) -> &'a str {
+            assert!(key.into_usize() < self.strings.len());
+            self.strings[key.into_usize()].as_str()
+        }
+
+        /// Resolves a string by its key, returning `None` if the key is out of bounds
+        pub fn try_resolve<'a>(&'a self, key: &K) -> Option<&'a str> {
+            if key.into_usize() < self.strings.len() {
+                Some(self.strings[key.into_usize()].as_str())
+            } else {
+                None
+            }
+        }
+
+        /// Resolves a string by its key without bounds checks
+        /// 
+        /// # Safety
+        /// 
+        /// The key must be valid for the current archived reader
+        pub unsafe fn resolve_unchecked<'a>(&'a self, key: &K) -> &'a str {
+            // Safety: Caller guarantees the key is valid
+            unsafe { self.strings.get_unchecked(key.into_usize()).as_str() }
+        }
+
+        /// Gets the number of interned strings
+        pub fn len(&self) -> usize {
+            self.strings.len()
+        }
+
+        /// Returns `true` if there are no currently interned strings
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+    }
+
+    impl<K: Archive + Key, S: BuildHasher + Default, D: rkyv::Fallible + ?Sized> 
+        Deserialize<RodeoReader<K, S>, D> for ArchivedRodeoReader<K::Archived>
+    where
+        K::Archived: Deserialize<K, D> + Key,
+    {
+        fn deserialize(&self, _deserializer: &mut D) -> Result<RodeoReader<K, S>, D::Error> {
+            let vector: Vec<String> = self.strings
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect();
+            
+            let capacity = {
+                let total_bytes = vector.iter().map(|s| s.len()).sum::<usize>();
+                let total_bytes =
+                    NonZeroUsize::new(total_bytes).unwrap_or_else(|| Capacity::default().bytes());
+
+                Capacity::new(vector.len(), total_bytes)
+            };
+
+            let hasher: S = Default::default();
+            let mut strings = Vec::with_capacity(capacity.strings);
+            let mut map = HashMap::with_capacity_and_hasher(capacity.strings, ());
+            let mut arena =
+                Arena::new(capacity.bytes, usize::MAX).expect("failed to allocate memory for interner");
+
+            for (key, string) in vector.into_iter().enumerate() {
+                let allocated = unsafe {
+                    arena
+                        .store_str(&string)
+                        .expect("failed to allocate enough memory")
+                };
+
+                let hash = hasher.hash_one(allocated);
+
+                let entry = map.raw_entry_mut().from_hash(hash, |key: &K| {
+                    let key_string: &str = unsafe { index_unchecked!(strings, key.into_usize()) };
+                    allocated == key_string
+                });
+
+                match entry {
+                    RawEntryMut::Occupied(..) => {
+                        debug_assert!(false, "re-interned a key while deserializing");
+                    }
+                    RawEntryMut::Vacant(entry) => {
+                        let key =
+                            K::try_from_usize(key).expect("failed to create key while deserializing");
+
+                        strings.push(allocated);
+
+                        entry.insert_with_hasher(hash, key, (), |key| {
+                            let key_string: &str =
+                                unsafe { index_unchecked!(strings, key.into_usize()) };
+
+                            hasher.hash_one(key_string)
+                        });
+                    }
+                }
+            }
+
+            Ok(RodeoReader {
+                map,
+                hasher,
+                strings,
+                __arena: AnyArena::Arena(arena),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     mod single_threaded {
@@ -732,6 +901,51 @@ mod tests {
             b.get_or_intern("b");
             b.get_or_intern("c");
             assert_eq!(a.into_reader(), b.into_resolver());
+        }
+
+        #[test]
+        #[cfg(feature = "rkyv")]
+        fn rkyv_serialize_empty() {
+            use rkyv::{archived_root, ser::{serializers::AllocSerializer, Serializer}};
+            use crate::RodeoReader;
+
+            let rodeo = Rodeo::default().into_reader();
+            
+            let mut serializer = AllocSerializer::<256>::default();
+            serializer.serialize_value(&rodeo).unwrap();
+            let bytes = serializer.into_serializer().into_inner();
+            
+            let archived = unsafe { archived_root::<RodeoReader>(&bytes) };
+            assert!(archived.is_empty());
+            assert_eq!(archived.len(), 0);
+        }
+
+        #[test]
+        #[cfg(feature = "rkyv")]
+        fn rkyv_serialize_filled() {
+            use rkyv::{archived_root, ser::{serializers::AllocSerializer, Serializer}};
+            use crate::RodeoReader;
+
+            let mut rodeo = Rodeo::default();
+            let a = rodeo.get_or_intern("a");
+            let b = rodeo.get_or_intern("b");
+            let c = rodeo.get_or_intern("c");
+            let reader = rodeo.into_reader();
+            
+            let mut serializer = AllocSerializer::<2048>::default();
+            serializer.serialize_value(&reader).unwrap();
+            let bytes = serializer.into_serializer().into_inner();
+            
+            let archived = unsafe { archived_root::<RodeoReader>(&bytes) };
+            assert_eq!(archived.len(), 3);
+            assert_eq!(archived.resolve(&a), "a");
+            assert_eq!(archived.resolve(&b), "b");
+            assert_eq!(archived.resolve(&c), "c");
+            assert_eq!(archived.get("a"), Some(a));
+            assert_eq!(archived.get("b"), Some(b));
+            assert_eq!(archived.get("c"), Some(c));
+            assert!(archived.contains("a"));
+            assert!(archived.contains_key(&a));
         }
     }
 

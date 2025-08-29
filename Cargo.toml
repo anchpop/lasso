@@ -20,6 +20,7 @@ no-std = ["ahasher"]
 multi-threaded = ["dashmap"]
 ahasher = ["ahash"]
 serialize = ["serde", "hashbrown/serde"]
+rkyv = ["dep:rkyv"]
 
 # Provides a concurrent hashmap, enabled with the `multi-threaded` feature
 [dependencies.dashmap]
@@ -56,6 +57,13 @@ optional = true
 [dependencies.deepsize]
 version = "0.2.0"
 default-features = false
+optional = true
+
+# Provides rkyv serialization support, enabled with the `rkyv` feature
+[dependencies.rkyv]
+version = "0.7"
+default-features = false
+features = ["alloc", "size_32"]
 optional = true
 
 # Benchmarking
