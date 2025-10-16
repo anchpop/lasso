@@ -1,6 +1,6 @@
 use crate::{
     arenas::{AnyArena, Arena},
-    hasher::RandomState,
+    hasher::DefaultHashBuilder,
     keys::{Key, Spur},
     reader::RodeoReader,
     resolver::RodeoResolver,
@@ -30,12 +30,12 @@ type StringMap<K> = HashMap<K, (), ()>;
 /// A string interner that caches strings quickly with a minimal memory footprint,
 /// returning a unique key to re-access it with `O(1)` times.
 ///
-/// By default Rodeo uses the [`Spur`] type for keys and [`RandomState`] as its hasher
+/// By default Rodeo uses the [`Spur`] type for keys and [`DefaultHashBuilder`] as its hasher
 ///
 /// [`Spur`]: crate::Spur
-/// [`RandomState`]: https://doc.rust-lang.org/std/collections/hash_map/struct.RandomState.html
+/// [`DefaultHashBuilder`]: crate::hasher::DefaultHashBuilder
 #[derive(Debug)]
-pub struct Rodeo<K = Spur, S = RandomState> {
+pub struct Rodeo<K = Spur, S = DefaultHashBuilder> {
     /// Map that allows `str` -> `key` resolution
     ///
     /// This must be a `HashMap` (for now) since `raw_api`s are only available for maps and not sets.
@@ -60,7 +60,7 @@ pub struct Rodeo<K = Spur, S = RandomState> {
     arena: Arena,
 }
 
-impl<K> Rodeo<K, RandomState>
+impl<K> Rodeo<K, DefaultHashBuilder>
 where
     K: Key,
 {
@@ -84,7 +84,7 @@ where
         Self::with_capacity_memory_limits_and_hasher(
             Capacity::default(),
             MemoryLimits::default(),
-            RandomState::new(),
+            DefaultHashBuilder::default(),
         )
     }
 
@@ -107,7 +107,7 @@ where
         Self::with_capacity_memory_limits_and_hasher(
             capacity,
             MemoryLimits::default(),
-            RandomState::new(),
+            DefaultHashBuilder::default(),
         )
     }
 
@@ -134,7 +134,7 @@ where
         Self::with_capacity_memory_limits_and_hasher(
             Capacity::default(),
             memory_limits,
-            RandomState::new(),
+            DefaultHashBuilder::default(),
         )
     }
 
@@ -162,7 +162,7 @@ where
         capacity: Capacity,
         memory_limits: MemoryLimits,
     ) -> Self {
-        Self::with_capacity_memory_limits_and_hasher(capacity, memory_limits, RandomState::new())
+        Self::with_capacity_memory_limits_and_hasher(capacity, memory_limits, DefaultHashBuilder::default())
     }
 }
 
@@ -176,10 +176,9 @@ where
     /// # Example
     ///
     /// ```rust
-    /// use lasso::{Spur, Rodeo};
-    /// use std::collections::hash_map::RandomState;
+    /// use lasso::{Spur, Rodeo, hasher::DefaultHashBuilder};
     ///
-    /// let rodeo: Rodeo<Spur, RandomState> = Rodeo::with_hasher(RandomState::new());
+    /// let rodeo: Rodeo<Spur, DefaultHashBuilder> = Rodeo::with_hasher(DefaultHashBuilder::default());
     /// ```
     ///
     #[cfg_attr(feature = "inline-more", inline)]
@@ -198,10 +197,9 @@ where
     /// # Example
     ///
     /// ```rust
-    /// use lasso::{Spur, Capacity, Rodeo};
-    /// use std::collections::hash_map::RandomState;
+    /// use lasso::{Spur, Capacity, Rodeo, hasher::DefaultHashBuilder};
     ///
-    /// let rodeo: Rodeo<Spur, RandomState> = Rodeo::with_capacity_and_hasher(Capacity::for_strings(10), RandomState::new());
+    /// let rodeo: Rodeo<Spur, DefaultHashBuilder> = Rodeo::with_capacity_and_hasher(Capacity::for_strings(10), DefaultHashBuilder::default());
     /// ```
     ///
     /// [`Capacity`]: crate::Capacity
@@ -221,13 +219,12 @@ where
     /// # Example
     ///
     /// ```rust
-    /// use lasso::{Spur, Capacity, MemoryLimits, Rodeo};
-    /// use std::collections::hash_map::RandomState;
+    /// use lasso::{Spur, Capacity, MemoryLimits, Rodeo, hasher::DefaultHashBuilder};
     ///
-    /// let rodeo: Rodeo<Spur, RandomState> = Rodeo::with_capacity_memory_limits_and_hasher(
+    /// let rodeo: Rodeo<Spur, DefaultHashBuilder> = Rodeo::with_capacity_memory_limits_and_hasher(
     ///     Capacity::for_strings(10),
     ///     MemoryLimits::for_memory_usage(4096),
-    ///     RandomState::new(),
+    ///     DefaultHashBuilder::default(),
     /// );
     /// ```
     ///
@@ -829,11 +826,11 @@ impl<K, S> Rodeo<K, S> {
     }
 }
 
-/// Creates a Rodeo using [`Spur`] as its key and [`RandomState`] as its hasher
+/// Creates a Rodeo using [`Spur`] as its key and [`DefaultHashBuilder`] as its hasher
 ///
 /// [`Spur`]: crate::Spur
-/// [`RandomState`]: index.html#cargo-features
-impl Default for Rodeo<Spur, RandomState> {
+/// [`DefaultHashBuilder`]: crate::hasher::DefaultHashBuilder
+impl Default for Rodeo<Spur, DefaultHashBuilder> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn default() -> Self {
         Self::new()
@@ -1147,7 +1144,7 @@ impl<'de, K: Key, S: BuildHasher + Default> Deserialize<'de> for Rodeo<K, S> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{hasher::RandomState, keys::MicroSpur, Capacity, Key, MemoryLimits, Rodeo, Spur};
+    use crate::{hasher::DefaultHashBuilder, keys::MicroSpur, Capacity, Key, MemoryLimits, Rodeo, Spur};
     use core::num::NonZeroUsize;
 
     compile! {
@@ -1183,7 +1180,7 @@ mod tests {
 
     #[test]
     fn with_hasher() {
-        let mut rodeo: Rodeo<Spur, RandomState> = Rodeo::with_hasher(RandomState::new());
+        let mut rodeo: Rodeo<Spur, DefaultHashBuilder> = Rodeo::with_hasher(DefaultHashBuilder::default());
         let key = rodeo.get_or_intern("Test");
         assert_eq!("Test", rodeo.resolve(&key));
 
@@ -1198,8 +1195,8 @@ mod tests {
 
     #[test]
     fn with_capacity_and_hasher() {
-        let mut rodeo: Rodeo<Spur, RandomState> =
-            Rodeo::with_capacity_and_hasher(Capacity::for_strings(10), RandomState::new());
+        let mut rodeo: Rodeo<Spur, DefaultHashBuilder> =
+            Rodeo::with_capacity_and_hasher(Capacity::for_strings(10), DefaultHashBuilder::default());
         assert_eq!(rodeo.capacity(), 10);
 
         rodeo.get_or_intern("Test");
@@ -1549,10 +1546,10 @@ mod tests {
 
     #[test]
     fn with_capacity_memory_limits_and_hasher() {
-        let mut rodeo: Rodeo<Spur, RandomState> = Rodeo::with_capacity_memory_limits_and_hasher(
+        let mut rodeo: Rodeo<Spur, DefaultHashBuilder> = Rodeo::with_capacity_memory_limits_and_hasher(
             Capacity::default(),
             MemoryLimits::default(),
-            RandomState::new(),
+            DefaultHashBuilder::default(),
         );
 
         rodeo.get_or_intern("Test");

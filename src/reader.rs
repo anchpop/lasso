@@ -1,6 +1,6 @@
 use crate::{
     arenas::AnyArena,
-    hasher::RandomState,
+    hasher::DefaultHashBuilder,
     keys::{Key, Spur},
     resolver::RodeoResolver,
     util::{Iter, Strings},
@@ -19,7 +19,7 @@ use hashbrown::HashMap;
 /// [`Rodeo`]: crate::Rodeo
 /// [`ThreadedRodeo`]: crate::ThreadedRodeo
 #[derive(Debug)]
-pub struct RodeoReader<K = Spur, S = RandomState> {
+pub struct RodeoReader<K = Spur, S = DefaultHashBuilder> {
     // The logic behind this arrangement is more heavily documented inside of
     // `Rodeo` itself
     map: HashMap<K, (), ()>,

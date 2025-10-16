@@ -47,6 +47,7 @@
 //!
 //! * `multi-threaded` - Enables [`struct@ThreadedRodeo`], the interner for multi-threaded tasks
 //! * `ahasher` - Use [`ahash`]'s `RandomState` as the default hasher
+//! * `deterministic` - Use a deterministic, platform-independent hasher (via [`highway`]'s `HighwayHasher`)
 //! * `no-std` - Enables `no_std` + `alloc` support for [`struct@Rodeo`] and [`struct@ThreadedRodeo`]
 //!   * Automatically enables the following required features:
 //!     * `ahasher` - `no_std` hashing function
@@ -461,10 +462,15 @@ compile! {
 #[doc(hidden)]
 mod hasher {
     compile! {
-        if #[feature = "ahasher"] {
-            pub use ahash::RandomState;
+        if #[feature = "deterministic"] {
+            pub use std::hash::BuildHasherDefault;
+            pub use highway::HighwayHasher;
+            // Using a deterministic hasher with fixed seed for platform-independent hashing
+            pub type DefaultHashBuilder = BuildHasherDefault<HighwayHasher>;
+        } else if #[feature = "ahasher"] {
+            pub type DefaultHashBuilder = ahash::RandomState;
         } else {
-            pub use std::collections::hash_map::RandomState;
+            pub type DefaultHashBuilder = std::collections::hash_map::RandomState;
         }
     }
 }

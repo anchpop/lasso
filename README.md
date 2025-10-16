@@ -34,6 +34,7 @@ To make use of [`ThreadedRodeo`], you must enable the `multi-threaded` feature.
 
 * `multi-threaded` - Enables [`ThreadedRodeo`], the interner for multi-threaded tasks
 * `ahasher` - Use [`ahash`]'s `RandomState` as the default hasher
+* `deterministic` - Use a deterministic, platform-independent hasher (via [`highway`]'s `HighwayHasher`) (takes priority over `ahasher`)
 * `no-std` - Enables `no_std` + `alloc` support for [`Rodeo`] and [`ThreadedRodeo`]
   * Automatically enables the following required features:
     * `ahasher` - `no_std` hashing function

@@ -1,6 +1,6 @@
 use crate::{
     arenas::{AnyArena, LockfreeArena},
-    hasher::RandomState,
+    hasher::DefaultHashBuilder,
     keys::{Key, Spur},
     reader::RodeoReader,
     resolver::RodeoResolver,
@@ -32,12 +32,11 @@ macro_rules! index_unchecked_mut {
 /// returning a unique key to re-access it with `O(1)` internment and resolution.
 ///
 /// This struct is only available with the `multi-threaded` feature!
-/// By default ThreadedRodeo uses the [`Spur`] type for keys and [`RandomState`] as the hasher
+/// By default ThreadedRodeo uses the [`Spur`] type for keys and [`DefaultHashBuilder`] as the hasher
 ///
 /// [`Spur`]: crate::Spur
-/// [`ahash::RandomState`]: https://docs.rs/ahash/0.3.2/ahash/struct.RandomState.html
-/// [`RandomState`]: index.html#cargo-features
-pub struct ThreadedRodeo<K = Spur, S = RandomState> {
+/// [`DefaultHashBuilder`]: crate::hasher::DefaultHashBuilder
+pub struct ThreadedRodeo<K = Spur, S = DefaultHashBuilder> {
     // TODO: Should this be migrated over to the scheme that `Rodeo` uses for string storage?
     //       Need benchmarks to see the perf impact of two dashmap lookups and see if that's worth
     //       the storage impact of extra string pointers lying around
@@ -53,7 +52,7 @@ pub struct ThreadedRodeo<K = Spur, S = RandomState> {
 
 // TODO: More parity functions with std::HashMap
 
-impl<K> ThreadedRodeo<K, RandomState>
+impl<K> ThreadedRodeo<K, DefaultHashBuilder>
 where
     K: Key + Hash,
 {
@@ -90,7 +89,7 @@ where
         Self::with_capacity_memory_limits_and_hasher(
             Capacity::default(),
             MemoryLimits::default(),
-            RandomState::new(),
+            DefaultHashBuilder::default(),
         )
     }
 
@@ -113,7 +112,7 @@ where
         Self::with_capacity_memory_limits_and_hasher(
             capacity,
             MemoryLimits::default(),
-            RandomState::new(),
+            DefaultHashBuilder::default(),
         )
     }
 
@@ -140,7 +139,7 @@ where
         Self::with_capacity_memory_limits_and_hasher(
             Capacity::default(),
             memory_limits,
-            RandomState::new(),
+            DefaultHashBuilder::default(),
         )
     }
 
@@ -168,7 +167,7 @@ where
         capacity: Capacity,
         memory_limits: MemoryLimits,
     ) -> Self {
-        Self::with_capacity_memory_limits_and_hasher(capacity, memory_limits, RandomState::new())
+        Self::with_capacity_memory_limits_and_hasher(capacity, memory_limits, DefaultHashBuilder::default())
     }
 }
 
@@ -183,9 +182,9 @@ where
     ///
     /// ```rust
     /// use lasso::{Spur, ThreadedRodeo};
-    /// use std::collections::hash_map::RandomState;
+    /// use lasso::hasher::DefaultHashBuilder;
     ///
-    /// let rodeo: ThreadedRodeo<Spur, RandomState> = ThreadedRodeo::with_hasher(RandomState::new());
+    /// let rodeo: ThreadedRodeo<Spur, DefaultHashBuilder> = ThreadedRodeo::with_hasher(DefaultHashBuilder::default());
     /// ```
     ///
     #[cfg_attr(feature = "inline-more", inline)]
@@ -205,9 +204,9 @@ where
     ///
     /// ```rust
     /// use lasso::{Spur, Capacity, ThreadedRodeo};
-    /// use std::collections::hash_map::RandomState;
+    /// use lasso::hasher::DefaultHashBuilder;
     ///
-    /// let rodeo: ThreadedRodeo<Spur, RandomState> = ThreadedRodeo::with_capacity_and_hasher(Capacity::for_strings(10), RandomState::new());
+    /// let rodeo: ThreadedRodeo<Spur, DefaultHashBuilder> = ThreadedRodeo::with_capacity_and_hasher(Capacity::for_strings(10), DefaultHashBuilder::default());
     /// ```
     ///
     /// [`Capacity`]: crate::Capacity
@@ -228,12 +227,12 @@ where
     ///
     /// ```rust
     /// use lasso::{Spur, Capacity, MemoryLimits, ThreadedRodeo};
-    /// use std::collections::hash_map::RandomState;
+    /// use lasso::hasher::DefaultHashBuilder;
     ///
-    /// let rodeo: ThreadedRodeo<Spur, RandomState> = ThreadedRodeo::with_capacity_memory_limits_and_hasher(
+    /// let rodeo: ThreadedRodeo<Spur, DefaultHashBuilder> = ThreadedRodeo::with_capacity_memory_limits_and_hasher(
     ///     Capacity::for_strings(10),
     ///     MemoryLimits::for_memory_usage(4096),
-    ///     RandomState::new(),
+    ///     DefaultHashBuilder::default(),
     /// );
     /// ```
     ///
@@ -1115,7 +1114,7 @@ mod tests {
 
     #[test]
     fn with_hasher() {
-        let rodeo: ThreadedRodeo<Spur, RandomState> =
+        let rodeo: ThreadedRodeo<Spur, DefaultHashBuilder> =
             ThreadedRodeo::with_hasher(RandomState::new());
 
         let key = rodeo.get_or_intern("Test");
@@ -1124,7 +1123,7 @@ mod tests {
 
     #[test]
     fn with_capacity_and_hasher() {
-        let rodeo: ThreadedRodeo<Spur, RandomState> =
+        let rodeo: ThreadedRodeo<Spur, DefaultHashBuilder> =
             ThreadedRodeo::with_capacity_and_hasher(Capacity::for_strings(10), RandomState::new());
 
         let key = rodeo.get_or_intern("Test");
@@ -1557,11 +1556,11 @@ mod tests {
 
     #[test]
     fn with_capacity_memory_limits_and_hasher() {
-        let rodeo: ThreadedRodeo<Spur, RandomState> =
+        let rodeo: ThreadedRodeo<Spur, DefaultHashBuilder> =
             ThreadedRodeo::with_capacity_memory_limits_and_hasher(
                 Capacity::default(),
                 MemoryLimits::default(),
-                RandomState::new(),
+                DefaultHashBuilder::default(),
             );
 
         rodeo.get_or_intern("Test");
