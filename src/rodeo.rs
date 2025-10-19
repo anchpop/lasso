@@ -25,7 +25,7 @@ compile! {
 }
 
 /// The map we use to associate keys to strings by the string's hash
-type StringMap<K> = HashMap<K, (), ()>;
+pub(crate) type StringMap<K> = HashMap<K, (), ()>;
 
 /// A string interner that caches strings quickly with a minimal memory footprint,
 /// returning a unique key to re-access it with `O(1)` times.
@@ -50,7 +50,7 @@ pub struct Rodeo<K = Spur, S = RandomState> {
     ///
     /// This allows us to only store references to the internally allocated strings once,
     /// which drastically decreases memory usage
-    map: StringMap<K>,
+    pub(crate) map: StringMap<K>,
     /// The hasher of the map. This is stored outside of the map so that we can use
     /// custom hashing on the keys of the map without the map itself trying to do something else
     hasher: S,

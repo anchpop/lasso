@@ -58,6 +58,13 @@ version = "0.2.0"
 default-features = false
 optional = true
 
+[dependencies.rkyv]
+git = "https://github.com/anchpop/rkyv.git"
+rev = "8a558ca3e043432dc55b0fc7bcce1068f9777ac8"
+
+[dependencies.bytecheck]
+version = "0.8"
+
 # Benchmarking
 [dev-dependencies.criterion]
 version = "0.3.4"

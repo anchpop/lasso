@@ -24,7 +24,7 @@ pub unsafe trait Key: Copy + Eq {
 ///
 /// [`ReadOnlyLasso`]: crate::ReadOnlyLasso
 /// [`Option`]: https://doc.rust-lang.org/std/option/enum.Option.html
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::bytecheck::CheckBytes)]
 #[repr(transparent)]
 pub struct LargeSpur {
     key: NonZeroUsize,
@@ -83,7 +83,7 @@ impl Debug for LargeSpur {
 ///
 /// [`ReadOnlyLasso`]: crate::ReadOnlyLasso
 /// [`Option`]: https://doc.rust-lang.org/std/option/enum.Option.html
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::bytecheck::CheckBytes)]
 #[repr(transparent)]
 pub struct Spur {
     key: NonZeroU32,
@@ -142,7 +142,7 @@ impl Debug for Spur {
 ///
 /// [`ReadOnlyLasso`]: crate::ReadOnlyLasso
 /// [`Option`]: https://doc.rust-lang.org/std/option/enum.Option.html
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::bytecheck::CheckBytes)]
 #[repr(transparent)]
 pub struct MiniSpur {
     key: NonZeroU16,
@@ -201,7 +201,7 @@ impl Debug for MiniSpur {
 ///
 /// [`ReadOnlyLasso`]: crate::ReadOnlyLasso
 /// [`Option`]: https://doc.rust-lang.org/std/option/enum.Option.html
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::bytecheck::CheckBytes)]
 #[repr(transparent)]
 pub struct MicroSpur {
     key: NonZeroU8,
@@ -393,6 +393,79 @@ impl_abomonation! {
     MiniSpur,
     MicroSpur,
     LargeSpur,
+}
+
+macro_rules! impl_rkyv {
+    ($($key:ident => $ty:ident),* $(,)?) => {
+        mod __rkyv {
+            use super::{$($key),*, Key};
+            use rkyv::{Archive, Deserialize, Serialize, Archived, Place, Portable, rancor::Fallible, util::AlignedVec, traits::NoUndef};
+
+            $(
+                // Safety: These are repr(transparent) newtypes around NonZero types,
+                // which have a well-defined portable representation
+                unsafe impl Portable for $key {}
+
+                // Safety: NonZero types cannot have undefined bytes
+                unsafe impl NoUndef for $key {}
+
+                impl Archive for $key {
+                    type Archived = Self;
+                    type Resolver = ();
+
+                    #[inline]
+                    fn resolve(&self, resolver: Self::Resolver, out: Place<Self::Archived>) {
+                        // Keys are Copy types that archive to themselves
+                        let _ = resolver;
+                        out.write(*self);
+                    }
+                }
+
+                impl<S: Fallible + ?Sized> Serialize<S> for $key {
+                    #[inline]
+                    fn serialize(&self, _serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+                        Ok(())
+                    }
+                }
+
+                impl<D: Fallible + ?Sized> Deserialize<$key, D> for Archived<$key> {
+                    #[inline]
+                    fn deserialize(&self, _deserializer: &mut D) -> Result<$key, D::Error> {
+                        Ok(*self)
+                    }
+                }
+
+                // Note: The archived form is the same as the original (type Archived = Self),
+                // so Key is already implemented for Archived<$key> since it's just $key
+            )*
+
+            #[cfg(test)]
+            mod tests {
+                use super::*;
+                use rkyv::api::high::to_bytes_in;
+
+                #[test]
+                fn all_archive() {
+                    $(
+                        let key = $key::try_from_usize(42).unwrap();
+                        let mut buf = AlignedVec::<16>::new();
+                        to_bytes_in::<_, rkyv::rancor::Error>(&key, &mut buf).unwrap();
+                        let archived = unsafe { rkyv::access_unchecked::<$key>(&buf[..]) };
+                        assert_eq!(key, *archived);
+                        assert_eq!(key.into_usize(), archived.into_usize());
+                    )*
+                }
+            }
+        }
+    };
+}
+
+// Implement `Archive`, `Serialize`, and `Deserialize` for rkyv
+impl_rkyv! {
+    Spur => NonZeroU32,
+    MiniSpur => NonZeroU16,
+    MicroSpur => NonZeroU8,
+    LargeSpur => NonZeroUsize,
 }
 
 #[cfg(test)]
