@@ -433,12 +433,14 @@ extern crate alloc;
 #[macro_use]
 mod util;
 mod arenas;
+mod archive;
 mod interface;
 mod keys;
 mod reader;
 mod resolver;
 mod rodeo;
 
+pub use archive::RodeoArchive;
 pub use interface::{Interner, IntoReader, IntoReaderAndResolver, IntoResolver, Reader, Resolver};
 pub use keys::{Key, LargeSpur, MicroSpur, MiniSpur, Spur};
 pub use reader::RodeoReader;

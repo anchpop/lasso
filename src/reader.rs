@@ -22,10 +22,10 @@ use hashbrown::HashMap;
 pub struct RodeoReader<K = Spur, S = RandomState> {
     // The logic behind this arrangement is more heavily documented inside of
     // `Rodeo` itself
-    map: HashMap<K, (), ()>,
-    hasher: S,
+    pub(crate) map: HashMap<K, (), ()>,
+    pub(crate) hasher: S,
     pub(crate) strings: Vec<&'static str>,
-    __arena: AnyArena,
+    pub(crate) __arena: AnyArena,
 }
 
 impl<K, S> RodeoReader<K, S> {
