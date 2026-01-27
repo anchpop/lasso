@@ -1,39 +1,116 @@
 use crate::{
     keys::{Key, Spur},
     reader::RodeoReader,
-    rodeo::Rodeo,
+    rodeo::{Internable, Rodeo},
 };
-use alloc::{string::String, vec::Vec};
+use alloc::vec::Vec;
 use core::hash::{BuildHasher, Hash};
 use rkyv::{
     collections::swiss_table::{ArchivedHashMap, HashMapResolver},
     hash::hash_value,
     rancor::{Fallible, Source},
     ser::{Allocator, Writer},
-    util::AlignedVec,
     with::{ArchiveWith, DeserializeWith, SerializeWith},
     Archive, Archived, Deserialize, Place, Serialize,
 };
 
+/// Trait for accessing the archived reference form of an interned type.
+///
+/// This is used to access the data stored in an archived rodeo.
+/// For `String`, this returns `&str`.
+/// For `Vec<T>`, this returns `&[Archived<T>]` (the archived element type).
+pub trait ArchivedInternedRef {
+    /// The reference type that can be obtained from the archived form
+    type Ref: ?Sized;
+
+    /// Get a reference to the archived data
+    fn as_archived_ref(&self) -> &Self::Ref;
+}
+
+impl ArchivedInternedRef for rkyv::string::ArchivedString {
+    type Ref = str;
+
+    fn as_archived_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<T> ArchivedInternedRef for rkyv::vec::ArchivedVec<T> {
+    type Ref = [T];
+
+    fn as_archived_ref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+/// Trait for comparing a query value against an archived interned value.
+///
+/// This enables lookups in the archived rodeo by value (the `get` method).
+/// The query type may differ from the archived type - for example, you can
+/// query with `&[i32]` even though the archived form is `&[i32_le]`.
+///
+/// # Implementing for Custom Types
+///
+/// If you're using a custom type with rkyv serialization, you need to implement
+/// this trait to enable `get()` lookups in the archived rodeo:
+///
+/// ```ignore
+/// impl ArchivedValueEq<[MyType]> for rkyv::vec::ArchivedVec<ArchivedMyType> {
+///     fn archived_eq(&self, query: &[MyType]) -> bool {
+///         // Compare archived values with query values
+///     }
+/// }
+/// ```
+pub trait ArchivedValueEq<Q: ?Sized> {
+    /// Returns true if the archived value equals the query value
+    fn archived_eq(&self, query: &Q) -> bool;
+}
+
+// String comparison: ArchivedString can be compared with &str
+impl ArchivedValueEq<str> for rkyv::string::ArchivedString {
+    fn archived_eq(&self, query: &str) -> bool {
+        self.as_str() == query
+    }
+}
+
+// Generic Vec comparison: works for any element type where Archived<T>: PartialEq<T>
+// This covers:
+// - u8 (archives to itself)
+// - All integer types (ArchivedI32: PartialEq<i32>, etc.)
+// - Custom types that implement PartialEq<OriginalType> on their archived form
+impl<T, AT> ArchivedValueEq<[T]> for rkyv::vec::ArchivedVec<AT>
+where
+    AT: PartialEq<T>,
+{
+    fn archived_eq(&self, query: &[T]) -> bool {
+        let slice = self.as_slice();
+        if slice.len() != query.len() {
+            return false;
+        }
+        slice.iter().zip(query.iter()).all(|(a, b)| a == b)
+    }
+}
+
 // Implement Archive for RodeoReader by converting to RodeoArchive
-impl<K, S> Archive for RodeoReader<K, S>
+impl<T: Internable, K, S> Archive for RodeoReader<T, K, S>
 where
     K: Key + Archive + Hash,
     S: BuildHasher,
     Archived<K>: Hash,
+    T: Archive,
 {
-    type Archived = ArchivedRodeoArchive<K>;
-    type Resolver = <RodeoArchive<K> as Archive>::Resolver;
+    type Archived = ArchivedRodeoArchive<T, K>;
+    type Resolver = <RodeoArchive<T, K> as Archive>::Resolver;
 
     fn resolve(&self, resolver: Self::Resolver, out: Place<Self::Archived>) {
         // Create a temporary RodeoArchive to resolve
-        let strings: Vec<String> = self.strings.iter().map(|s| String::from(*s)).collect();
+        let strings: Vec<T> = self.strings.iter().map(|s| T::from_ref(*s)).collect();
         let entries: Vec<(K, u64)> = self
             .map
             .iter()
             .map(|(key, _)| {
                 let string = &strings[key.into_usize()];
-                let hash = hash_value::<String, rkyv::hash::FxHasher64>(string);
+                let hash = hash_value::<T, rkyv::hash::FxHasher64>(string);
                 (*key, hash)
             })
             .collect();
@@ -48,9 +125,11 @@ where
     }
 }
 
-impl<K, S, Ser> Serialize<Ser> for RodeoReader<K, S>
+impl<T: Internable, K, S, Ser> Serialize<Ser> for RodeoReader<T, K, S>
 where
+    T: Archive + Serialize<Ser>,
     K: Key + Archive + Serialize<Ser> + Hash + Eq,
+    T: Archive,
     S: BuildHasher,
     Archived<K>: Hash,
     Ser: Fallible + Writer + Allocator + ?Sized,
@@ -58,13 +137,13 @@ where
 {
     fn serialize(&self, serializer: &mut Ser) -> Result<Self::Resolver, Ser::Error> {
         // Convert to RodeoArchive and serialize that
-        let strings: Vec<String> = self.strings.iter().map(|s| String::from(*s)).collect();
+        let strings: Vec<T> = self.strings.iter().map(|s| T::from_ref(*s)).collect();
         let entries: Vec<(K, u64)> = self
             .map
             .iter()
             .map(|(key, _)| {
                 let string = &strings[key.into_usize()];
-                let hash = hash_value::<String, rkyv::hash::FxHasher64>(string);
+                let hash = hash_value::<T, rkyv::hash::FxHasher64>(string);
                 (*key, hash)
             })
             .collect();
@@ -77,21 +156,26 @@ where
     }
 }
 
-// Implement Deserialize for RodeoReader by creating a new Rodeo and interning all strings
-impl<K, S, D> Deserialize<RodeoReader<K, S>, D> for ArchivedRodeoArchive<K>
+// Implement Deserialize for RodeoReader by creating a new Rodeo and interning all strings.
+// This uses rkyv's Deserialize trait to convert each archived value back to the original type.
+impl<T: Internable, K, S, D> Deserialize<RodeoReader<T, K, S>, D> for ArchivedRodeoArchive<T, K>
 where
+    T: Archive + AsRef<T::Ref>,
+    Archived<T>: Deserialize<T, D>,
     K: Archive + Key,
     S: BuildHasher + Default,
     Archived<K>: Deserialize<K, D>,
     D: Fallible + ?Sized,
 {
-    fn deserialize(&self, _deserializer: &mut D) -> Result<RodeoReader<K, S>, D::Error> {
+    fn deserialize(&self, deserializer: &mut D) -> Result<RodeoReader<T, K, S>, D::Error> {
         // Create a new Rodeo and intern all the strings
-        let mut rodeo = crate::Rodeo::<K, S>::with_hasher(S::default());
+        let mut rodeo = crate::Rodeo::<T, K, S>::with_hasher(S::default());
 
+        // Deserialize each archived value and intern it
         // We need to recreate the strings in the same order to preserve key mappings
-        for string in self.strings.iter() {
-            rodeo.get_or_intern(string.as_str());
+        for archived_string in self.strings.iter() {
+            let value: T = archived_string.deserialize(deserializer)?;
+            rodeo.get_or_intern(value);
         }
 
         // Convert to RodeoReader
@@ -111,25 +195,25 @@ where
 /// use lasso::{Rodeo, RodeoArchive};
 /// use rkyv::{util::AlignedVec, Archived, api::high::to_bytes_in};
 ///
-/// let mut rodeo = Rodeo::default();
+/// let mut rodeo: Rodeo = Rodeo::default();
 /// let key = rodeo.get_or_intern("Hello, world!");
 ///
 /// // Convert to an archive-ready format
 /// let archive = RodeoArchive::from(rodeo);
 ///
 /// // Serialize with rkyv
-/// let mut bytes = AlignedVec::new();
+/// let mut bytes = AlignedVec::<16>::new();
 /// to_bytes_in::<_, rkyv::rancor::Error>(&archive, &mut bytes).unwrap();
 ///
 /// // Access the archived data directly (zero-copy)
-/// let archived: &Archived<RodeoArchive> = unsafe { rkyv::access_unchecked(&bytes[..]) };
+/// let archived: &Archived<RodeoArchive<String>> = unsafe { rkyv::access_unchecked(&bytes[..]) };
 /// assert_eq!(archived.lookup(&key), "Hello, world!");
 /// ```
 #[derive(Archive, Serialize, Deserialize, Debug)]
-pub struct RodeoArchive<K = Spur> {
+pub struct RodeoArchive<T: Internable, K = Spur> {
     /// The interned strings
     /// Stored as owned Strings for serialization
-    strings: Vec<String>,
+    strings: Vec<T>,
 
     /// Mapping from string hashes to keys
     /// Serialized with pre-computed hashes using custom wrapper
@@ -137,19 +221,20 @@ pub struct RodeoArchive<K = Spur> {
     map: Vec<(K, u64)>, // (key, hash_of_string)
 }
 
-impl<K> RodeoArchive<K>
+impl<T, K> RodeoArchive<T, K>
 where
+    T: Internable,
     K: Key,
 {
     /// Creates a new `RodeoArchive` from a `Rodeo`
     ///
     /// This will allocate owned strings for all interned strings and compute hashes
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn from_rodeo<S>(rodeo: Rodeo<K, S>) -> Self
+    pub fn from_rodeo<S>(rodeo: Rodeo<T, K, S>) -> Self
     where
         S: BuildHasher,
     {
-        let strings: Vec<String> = rodeo.strings.iter().map(|s| String::from(*s)).collect();
+        let strings: Vec<T> = rodeo.strings.iter().map(|s| T::from_ref(s)).collect();
 
         // Create entries with (key, hash) pairs
         // The hash is the hash of the string, not the hash of the key
@@ -158,7 +243,7 @@ where
             .into_iter()
             .map(|(key, _)| {
                 let string = &strings[key.into_usize()];
-                let hash = hash_value::<String, rkyv::hash::FxHasher64>(string);
+                let hash = hash_value::<T, rkyv::hash::FxHasher64>(string);
                 (key, hash)
             })
             .collect();
@@ -173,11 +258,11 @@ where
     ///
     /// This will allocate owned strings for all interned strings and compute hashes
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn from_reader<S>(reader: RodeoReader<K, S>) -> Self
+    pub fn from_reader<S>(reader: RodeoReader<T, K, S>) -> Self
     where
         S: BuildHasher,
     {
-        let strings: Vec<String> = reader.strings.iter().map(|s| String::from(*s)).collect();
+        let strings: Vec<T> = reader.strings.iter().map(|s| T::from_ref(*s)).collect();
 
         // Create entries with (key, hash) pairs
         let entries: Vec<(K, u64)> = reader
@@ -185,7 +270,7 @@ where
             .into_iter()
             .map(|(key, _)| {
                 let string = &strings[key.into_usize()];
-                let hash = hash_value::<String, rkyv::hash::FxHasher64>(string);
+                let hash = hash_value::<T, rkyv::hash::FxHasher64>(string);
                 (key, hash)
             })
             .collect();
@@ -209,33 +294,35 @@ where
     }
 }
 
-impl<K, S> From<Rodeo<K, S>> for RodeoArchive<K>
+impl<T: Internable, K, S> From<Rodeo<T, K, S>> for RodeoArchive<T, K>
 where
     K: Key,
     S: BuildHasher,
 {
     #[cfg_attr(feature = "inline-more", inline)]
-    fn from(rodeo: Rodeo<K, S>) -> Self {
+    fn from(rodeo: Rodeo<T, K, S>) -> Self {
         Self::from_rodeo(rodeo)
     }
 }
 
-impl<K, S> From<RodeoReader<K, S>> for RodeoArchive<K>
+impl<T: Internable, K, S> From<RodeoReader<T, K, S>> for RodeoArchive<T, K>
 where
     K: Key,
     S: BuildHasher,
 {
     #[cfg_attr(feature = "inline-more", inline)]
-    fn from(reader: RodeoReader<K, S>) -> Self {
+    fn from(reader: RodeoReader<T, K, S>) -> Self {
         Self::from_reader(reader)
     }
 }
 
 // Implement Debug for ArchivedRodeoArchive
-impl<K> core::fmt::Debug for ArchivedRodeoArchive<K>
+impl<T, K> core::fmt::Debug for ArchivedRodeoArchive<T, K>
 where
+    T: Internable + Archive,
     K: Archive,
     Archived<K>: core::fmt::Debug,
+    Archived<T>: core::fmt::Debug,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ArchivedRodeoArchive")
@@ -246,20 +333,22 @@ where
 }
 
 // Implement PartialEq for comparison with RodeoReader in rkyv's compare attribute
-impl<K, S> PartialEq<RodeoReader<K, S>> for ArchivedRodeoArchive<K>
+impl<T: Internable + Archive, K, S> PartialEq<RodeoReader<T, K, S>> for ArchivedRodeoArchive<T, K>
 where
     K: Archive + Key,
     Archived<K>: PartialEq<K> + Key,
+    T: Archive,
+    Archived<T>: ArchivedValueEq<T::Ref>,
     S: BuildHasher,
 {
-    fn eq(&self, other: &RodeoReader<K, S>) -> bool {
+    fn eq(&self, other: &RodeoReader<T, K, S>) -> bool {
         if self.strings.len() != other.strings.len() {
             return false;
         }
 
         // Check that all strings match
         for (i, archived_string) in self.strings.iter().enumerate() {
-            if archived_string.as_str() != other.strings[i] {
+            if !archived_string.archived_eq(other.strings[i]) {
                 return false;
             }
         }
@@ -268,13 +357,25 @@ where
     }
 }
 
-/// Archived version of RodeoArchive provides zero-copy string access
-impl<K> ArchivedRodeoArchive<K>
+/// Archived version of RodeoArchive provides zero-copy access
+///
+/// The `lookup` method returns the archived reference type, which may differ from
+/// the original type. For example:
+/// - `String` -> `&str` (same)
+/// - `Vec<u8>` -> `&[u8]` (same)
+/// - `Vec<i32>` -> `&[ArchivedI32]` (archived integers)
+impl<T, K> ArchivedRodeoArchive<T, K>
 where
+    T: Internable + Archive,
+    Archived<T>: ArchivedInternedRef,
     K: Archive + Hash,
     Archived<K>: Eq + Hash + Copy + Key,
 {
-    /// Looks up the string associated with a given key
+    /// Looks up the archived value associated with a given key
+    ///
+    /// Returns a reference to the archived form of the interned value.
+    /// For `String`, this returns `&str`.
+    /// For `Vec<T>`, this returns `&[Archived<T>]`.
     ///
     /// # Panics
     ///
@@ -286,88 +387,49 @@ where
     /// use lasso::{Rodeo, RodeoArchive};
     /// use rkyv::{util::AlignedVec, Archived, api::high::to_bytes_in};
     ///
-    /// let mut rodeo = Rodeo::default();
+    /// let mut rodeo: Rodeo = Rodeo::default();
     /// let key = rodeo.get_or_intern("Hello, world!");
     ///
     /// let archive = RodeoArchive::from(rodeo);
-    /// let mut bytes = AlignedVec::new();
+    /// let mut bytes = AlignedVec::<16>::new();
     /// to_bytes_in::<_, rkyv::rancor::Error>(&archive, &mut bytes).unwrap();
     ///
-    /// let archived: &Archived<RodeoArchive> = unsafe { rkyv::access_unchecked(&bytes[..]) };
+    /// let archived: &Archived<RodeoArchive<String>> = unsafe { rkyv::access_unchecked(&bytes[..]) };
     /// assert_eq!(archived.lookup(&key), "Hello, world!");
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn lookup(&self, key: &Archived<K>) -> &str {
+    pub fn lookup(&self, key: &Archived<K>) -> &<Archived<T> as ArchivedInternedRef>::Ref {
         let index = key.into_usize();
         assert!(index < self.strings.len(), "Key out of bounds");
-        &self.strings[index]
+        self.strings[index].as_archived_ref()
     }
 
-    /// Looks up the string for a key, returning `None` if it's out of bounds
+    /// Looks up the archived value for a key, returning `None` if it's out of bounds
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn try_lookup(&self, key: &Archived<K>) -> Option<&str> {
+    pub fn try_lookup(
+        &self,
+        key: &Archived<K>,
+    ) -> Option<&<Archived<T> as ArchivedInternedRef>::Ref> {
         let index = key.into_usize();
         if index < self.strings.len() {
-            Some(&self.strings[index])
+            Some(self.strings[index].as_archived_ref())
         } else {
             None
         }
     }
 
-    /// Looks up the string for a key without bounds checks
+    /// Looks up the archived value for a key without bounds checks
     ///
     /// # Safety
     ///
     /// The key must be valid for the current archive
     #[cfg_attr(feature = "inline-more", inline)]
-    pub unsafe fn lookup_unchecked(&self, key: &Archived<K>) -> &str {
+    pub unsafe fn lookup_unchecked(
+        &self,
+        key: &Archived<K>,
+    ) -> &<Archived<T> as ArchivedInternedRef>::Ref {
         let index = key.into_usize();
-        unsafe { self.strings.get_unchecked(index).as_str() }
-    }
-
-    /// Get the key value of a string, returning `None` if it doesn't exist
-    ///
-    /// Note: This requires computing the hash of the string at query time
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use lasso::{Rodeo, RodeoArchive};
-    /// use rkyv::{util::AlignedVec, Archived, api::high::to_bytes_in};
-    ///
-    /// let mut rodeo = Rodeo::default();
-    /// let key = rodeo.get_or_intern("Hello, world!");
-    ///
-    /// let archive = RodeoArchive::from(rodeo);
-    /// let mut bytes = AlignedVec::new();
-    /// to_bytes_in::<_, rkyv::rancor::Error>(&archive, &mut bytes).unwrap();
-    ///
-    /// let archived: &Archived<RodeoArchive> = unsafe { rkyv::access_unchecked(&bytes[..]) };
-    /// assert_eq!(Some(key), archived.get("Hello, world!"));
-    /// ```
-    #[cfg_attr(feature = "inline-more", inline)]
-    pub fn get(&self, val: &str) -> Option<Archived<K>> {
-        // Hash the string using rkyv's hash function
-        let hash = hash_value::<str, rkyv::hash::FxHasher64>(val);
-
-        // Look up in the archived hashmap using raw entry API
-        self.map
-            .raw_entry()
-            .from_hash(hash, |entry| {
-                let index = entry.key.into_usize();
-                if index < self.strings.len() {
-                    val == &self.strings[index]
-                } else {
-                    false
-                }
-            })
-            .map(|(key, _)| *key)
-    }
-
-    /// Returns `true` if the given string has been interned
-    #[cfg_attr(feature = "inline-more", inline)]
-    pub fn contains(&self, val: &str) -> bool {
-        self.get(val).is_some()
+        unsafe { self.strings.get_unchecked(index).as_archived_ref() }
     }
 
     /// Returns `true` if the given key exists in the current archive
@@ -389,12 +451,68 @@ where
     }
 }
 
-impl<K> core::ops::Index<Archived<K>> for ArchivedRodeoArchive<K>
+/// Methods for looking up by value (requires `ArchivedValueEq`)
+impl<T, K> ArchivedRodeoArchive<T, K>
 where
+    T: Internable + Archive,
+    Archived<T>: ArchivedValueEq<T::Ref>,
     K: Archive + Hash,
     Archived<K>: Eq + Hash + Copy + Key,
 {
-    type Output = str;
+    /// Get the key value of a string, returning `None` if it doesn't exist
+    ///
+    /// Note: This requires computing the hash of the string at query time
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use lasso::{Rodeo, RodeoArchive};
+    /// use rkyv::{util::AlignedVec, Archived, api::high::to_bytes_in};
+    ///
+    /// let mut rodeo: Rodeo = Rodeo::default();
+    /// let key = rodeo.get_or_intern("Hello, world!");
+    ///
+    /// let archive = RodeoArchive::from(rodeo);
+    /// let mut bytes = AlignedVec::<16>::new();
+    /// to_bytes_in::<_, rkyv::rancor::Error>(&archive, &mut bytes).unwrap();
+    ///
+    /// let archived: &Archived<RodeoArchive<String>> = unsafe { rkyv::access_unchecked(&bytes[..]) };
+    /// assert_eq!(Some(key), archived.get("Hello, world!"));
+    /// ```
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn get(&self, val: &T::Ref) -> Option<Archived<K>> {
+        // Hash the string using rkyv's hash function
+        let hash = hash_value::<T::Ref, rkyv::hash::FxHasher64>(val);
+
+        // Look up in the archived hashmap using raw entry API
+        self.map
+            .raw_entry()
+            .from_hash(hash, |entry| {
+                let index = entry.key.into_usize();
+                if index < self.strings.len() {
+                    self.strings[index].archived_eq(val)
+                } else {
+                    false
+                }
+            })
+            .map(|(key, _)| *key)
+    }
+
+    /// Returns `true` if the given string has been interned
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn contains(&self, val: &T::Ref) -> bool {
+        self.get(val).is_some()
+    }
+}
+
+impl<T, K> core::ops::Index<Archived<K>> for ArchivedRodeoArchive<T, K>
+where
+    T: Internable + Archive,
+    Archived<T>: ArchivedInternedRef,
+    K: Archive + Hash,
+    Archived<K>: Eq + Hash + Copy + Key,
+{
+    type Output = <Archived<T> as ArchivedInternedRef>::Ref;
 
     #[cfg_attr(feature = "inline-more", inline)]
     fn index(&self, key: Archived<K>) -> &Self::Output {
@@ -413,11 +531,7 @@ where
     type Resolver = HashMapResolver;
 
     #[inline]
-    fn resolve_with(
-        field: &Vec<(K, u64)>,
-        resolver: Self::Resolver,
-        out: Place<Self::Archived>,
-    ) {
+    fn resolve_with(field: &Vec<(K, u64)>, resolver: Self::Resolver, out: Place<Self::Archived>) {
         ArchivedHashMap::<Archived<K>, ()>::resolve_from_len(
             field.len(),
             (7, 8), // load factor
@@ -449,8 +563,7 @@ where
     }
 }
 
-impl<K, D>
-    DeserializeWith<ArchivedHashMap<Archived<K>, ()>, Vec<(K, u64)>, D>
+impl<K, D> DeserializeWith<ArchivedHashMap<Archived<K>, ()>, Vec<(K, u64)>, D>
     for HashMapWithHashes<K>
 where
     K: Archive,
@@ -477,11 +590,14 @@ where
 mod tests {
     use super::*;
     use crate::Rodeo;
+    #[cfg(feature = "no-std")]
+    use alloc::string::{String, ToString};
     use rkyv::api::high::to_bytes_in;
+    use rkyv::util::AlignedVec;
 
     #[test]
     fn basic_archive() {
-        let mut rodeo = Rodeo::default();
+        let mut rodeo: Rodeo = Rodeo::default();
         let hello = rodeo.get_or_intern("Hello");
         let world = rodeo.get_or_intern("World");
 
@@ -490,7 +606,8 @@ mod tests {
 
         let mut bytes = AlignedVec::<16>::new();
         to_bytes_in::<_, rkyv::rancor::Error>(&archive, &mut bytes).unwrap();
-        let archived: &Archived<RodeoArchive> = unsafe { rkyv::access_unchecked(&bytes[..]) };
+        let archived: &Archived<RodeoArchive<String>> =
+            unsafe { rkyv::access_unchecked(&bytes[..]) };
 
         assert_eq!(archived.len(), 2);
         assert_eq!(archived.lookup(&hello), "Hello");
@@ -499,14 +616,15 @@ mod tests {
 
     #[test]
     fn archive_get() {
-        let mut rodeo = Rodeo::default();
+        let mut rodeo: Rodeo = Rodeo::default();
         let hello = rodeo.get_or_intern("Hello");
         rodeo.get_or_intern("World");
 
         let archive = RodeoArchive::from(rodeo);
         let mut bytes = AlignedVec::<16>::new();
         to_bytes_in::<_, rkyv::rancor::Error>(&archive, &mut bytes).unwrap();
-        let archived: &Archived<RodeoArchive> = unsafe { rkyv::access_unchecked(&bytes[..]) };
+        let archived: &Archived<RodeoArchive<String>> =
+            unsafe { rkyv::access_unchecked(&bytes[..]) };
 
         assert_eq!(archived.get("Hello"), Some(hello));
         assert_eq!(archived.get("World").is_some(), true);
@@ -515,13 +633,14 @@ mod tests {
 
     #[test]
     fn archive_contains() {
-        let mut rodeo = Rodeo::default();
+        let mut rodeo: Rodeo = Rodeo::default();
         rodeo.get_or_intern("Hello");
 
         let archive = RodeoArchive::from(rodeo);
         let mut bytes = AlignedVec::<16>::new();
         to_bytes_in::<_, rkyv::rancor::Error>(&archive, &mut bytes).unwrap();
-        let archived: &Archived<RodeoArchive> = unsafe { rkyv::access_unchecked(&bytes[..]) };
+        let archived: &Archived<RodeoArchive<String>> =
+            unsafe { rkyv::access_unchecked(&bytes[..]) };
 
         assert!(archived.contains("Hello"));
         assert!(!archived.contains("Missing"));
@@ -529,14 +648,15 @@ mod tests {
 
     #[test]
     fn archive_from_reader() {
-        let mut rodeo = Rodeo::default();
+        let mut rodeo: Rodeo = Rodeo::default();
         let key = rodeo.get_or_intern("Test");
         let reader = rodeo.into_reader();
 
         let archive = RodeoArchive::from(reader);
         let mut bytes = AlignedVec::<16>::new();
         to_bytes_in::<_, rkyv::rancor::Error>(&archive, &mut bytes).unwrap();
-        let archived: &Archived<RodeoArchive> = unsafe { rkyv::access_unchecked(&bytes[..]) };
+        let archived: &Archived<RodeoArchive<String>> =
+            unsafe { rkyv::access_unchecked(&bytes[..]) };
 
         assert_eq!(archived.lookup(&key), "Test");
     }
@@ -544,7 +664,7 @@ mod tests {
     #[test]
     fn archive_reader_directly() {
         // Test that RodeoReader implements Archive directly
-        let mut rodeo = Rodeo::default();
+        let mut rodeo: Rodeo = Rodeo::default();
         let hello = rodeo.get_or_intern("Hello");
         let world = rodeo.get_or_intern("World");
         let reader = rodeo.into_reader();
@@ -554,7 +674,8 @@ mod tests {
         to_bytes_in::<_, rkyv::rancor::Error>(&reader, &mut bytes).unwrap();
 
         // Access archived data
-        let archived: &Archived<RodeoReader> = unsafe { rkyv::access_unchecked(&bytes[..]) };
+        let archived: &Archived<RodeoReader<String>> =
+            unsafe { rkyv::access_unchecked(&bytes[..]) };
 
         assert_eq!(archived.len(), 2);
         assert_eq!(archived.lookup(&hello), "Hello");
@@ -568,40 +689,18 @@ mod tests {
         use crate::RodeoReader;
 
         #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-        #[rkyv(compare(PartialEq), derive(Debug))]
+        #[rkyv(derive(Debug))]
         struct LanguagePack {
             name: String,
-            strings: RodeoReader,
+            strings: RodeoReader<String>,
         }
 
         // Create a language pack with many strings
-        let mut rodeo = Rodeo::default();
+        let mut rodeo: Rodeo = Rodeo::default();
         let greetings = [
-            "Hello",
-            "World",
-            "Goodbye",
-            "Welcome",
-            "Thanks",
-            "Please",
-            "Sorry",
-            "Yes",
-            "No",
-            "Maybe",
-            "Help",
-            "Stop",
-            "Go",
-            "Wait",
-            "Continue",
-            "Start",
-            "End",
-            "Begin",
-            "Finish",
-            "Complete",
-            "Success",
-            "Error",
-            "Warning",
-            "Info",
-            "Debug",
+            "Hello", "World", "Goodbye", "Welcome", "Thanks", "Please", "Sorry", "Yes", "No",
+            "Maybe", "Help", "Stop", "Go", "Wait", "Continue", "Start", "End", "Begin", "Finish",
+            "Complete", "Success", "Error", "Warning", "Info", "Debug",
         ];
 
         let keys: Vec<_> = greetings.iter().map(|s| rodeo.get_or_intern(s)).collect();
@@ -638,14 +737,14 @@ mod tests {
         use crate::RodeoReader;
 
         #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-        #[rkyv(compare(PartialEq), derive(Debug))]
+        #[rkyv(derive(Debug))]
         struct LanguagePack {
             name: String,
-            strings: RodeoReader,
+            strings: RodeoReader<String>,
         }
 
         // Create a language pack
-        let mut rodeo = Rodeo::default();
+        let mut rodeo: Rodeo = Rodeo::default();
         let hello = rodeo.get_or_intern("Hello");
         let world = rodeo.get_or_intern("World");
         let goodbye = rodeo.get_or_intern("Goodbye");
@@ -661,7 +760,8 @@ mod tests {
 
         // Deserialize
         let archived: &Archived<LanguagePack> = unsafe { rkyv::access_unchecked(&bytes[..]) };
-        let deserialized: LanguagePack = rkyv::deserialize::<LanguagePack, rkyv::rancor::Error>(archived).unwrap();
+        let deserialized: LanguagePack =
+            rkyv::deserialize::<LanguagePack, rkyv::rancor::Error>(archived).unwrap();
 
         // Verify the deserialized data
         assert_eq!(deserialized.name, "Test");
