@@ -105,7 +105,7 @@ where
     fn resolve(&self, resolver: Self::Resolver, out: Place<Self::Archived>) {
         // Create a temporary RodeoArchive to resolve
         let strings: Vec<T> = self.strings.iter().map(|s| T::from_ref(*s)).collect();
-        let entries: Vec<(K, u64)> = self
+        let mut entries: Vec<(K, u64)> = self
             .map
             .iter()
             .map(|(key, _)| {
@@ -114,6 +114,8 @@ where
                 (*key, hash)
             })
             .collect();
+        // Sort entries for deterministic serialization (HashMap iteration order is random)
+        entries.sort_by_key(|(key, _)| key.into_usize());
 
         let archive = RodeoArchive {
             strings,
@@ -138,7 +140,7 @@ where
     fn serialize(&self, serializer: &mut Ser) -> Result<Self::Resolver, Ser::Error> {
         // Convert to RodeoArchive and serialize that
         let strings: Vec<T> = self.strings.iter().map(|s| T::from_ref(*s)).collect();
-        let entries: Vec<(K, u64)> = self
+        let mut entries: Vec<(K, u64)> = self
             .map
             .iter()
             .map(|(key, _)| {
@@ -147,6 +149,8 @@ where
                 (*key, hash)
             })
             .collect();
+        // Sort entries for deterministic serialization (HashMap iteration order is random)
+        entries.sort_by_key(|(key, _)| key.into_usize());
 
         let archive = RodeoArchive {
             strings,
@@ -238,7 +242,7 @@ where
 
         // Create entries with (key, hash) pairs
         // The hash is the hash of the string, not the hash of the key
-        let entries: Vec<(K, u64)> = rodeo
+        let mut entries: Vec<(K, u64)> = rodeo
             .map
             .into_iter()
             .map(|(key, _)| {
@@ -247,6 +251,8 @@ where
                 (key, hash)
             })
             .collect();
+        // Sort entries for deterministic serialization (HashMap iteration order is random)
+        entries.sort_by_key(|(key, _)| key.into_usize());
 
         Self {
             strings,
@@ -265,7 +271,7 @@ where
         let strings: Vec<T> = reader.strings.iter().map(|s| T::from_ref(*s)).collect();
 
         // Create entries with (key, hash) pairs
-        let entries: Vec<(K, u64)> = reader
+        let mut entries: Vec<(K, u64)> = reader
             .map
             .into_iter()
             .map(|(key, _)| {
@@ -274,6 +280,8 @@ where
                 (key, hash)
             })
             .collect();
+        // Sort entries for deterministic serialization (HashMap iteration order is random)
+        entries.sort_by_key(|(key, _)| key.into_usize());
 
         Self {
             strings,
