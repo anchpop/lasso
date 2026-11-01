@@ -10,7 +10,7 @@ use rkyv::{
     hash::hash_value,
     rancor::{Fallible, Source},
     ser::{Allocator, Writer},
-    with::{ArchiveWith, DeserializeWith, SerializeWith},
+    with::{ArchiveWith, SerializeWith},
     Archive, Archived, Deserialize, Place, Serialize,
 };
 
@@ -109,7 +109,7 @@ where
             .map
             .iter()
             .map(|(key, _)| {
-                let string = &strings[key.into_usize()];
+                let string = &strings[key.into_usize() - self.first_key];
                 let hash = hash_value::<T, rkyv::hash::FxHasher64>(string);
                 (*key, hash)
             })
@@ -118,6 +118,7 @@ where
         entries.sort_by_key(|(key, _)| key.into_usize());
 
         let archive = RodeoArchive {
+            first_key: self.first_key,
             strings,
             map: entries,
         };
@@ -144,7 +145,7 @@ where
             .map
             .iter()
             .map(|(key, _)| {
-                let string = &strings[key.into_usize()];
+                let string = &strings[key.into_usize() - self.first_key];
                 let hash = hash_value::<T, rkyv::hash::FxHasher64>(string);
                 (*key, hash)
             })
@@ -153,6 +154,7 @@ where
         entries.sort_by_key(|(key, _)| key.into_usize());
 
         let archive = RodeoArchive {
+            first_key: self.first_key,
             strings,
             map: entries,
         };
@@ -173,7 +175,9 @@ where
 {
     fn deserialize(&self, deserializer: &mut D) -> Result<RodeoReader<T, K, S>, D::Error> {
         // Create a new Rodeo and intern all the strings
-        let mut rodeo = crate::Rodeo::<T, K, S>::with_hasher(S::default());
+        let first_key =
+            K::try_from_usize(self.first_key.to_native() as usize).expect("invalid first key");
+        let mut rodeo = crate::Rodeo::<T, K, S>::with_first_key_and_hasher(first_key, S::default());
 
         // Deserialize each archived value and intern it
         // We need to recreate the strings in the same order to preserve key mappings
@@ -213,8 +217,9 @@ where
 /// let archived: &Archived<RodeoArchive<String>> = unsafe { rkyv::access_unchecked(&bytes[..]) };
 /// assert_eq!(archived.lookup(&key), "Hello, world!");
 /// ```
-#[derive(Archive, Serialize, Deserialize, Debug)]
+#[derive(Archive, Serialize, Debug)]
 pub struct RodeoArchive<T: Internable, K = Spur> {
+    first_key: usize,
     /// The interned strings
     /// Stored as owned Strings for serialization
     strings: Vec<T>,
@@ -223,6 +228,40 @@ pub struct RodeoArchive<T: Internable, K = Spur> {
     /// Serialized with pre-computed hashes using custom wrapper
     #[rkyv(with = HashMapWithHashes<K>)]
     map: Vec<(K, u64)>, // (key, hash_of_string)
+}
+
+impl<T, K, D> Deserialize<RodeoArchive<T, K>, D> for ArchivedRodeoArchive<T, K>
+where
+    T: Internable + Archive,
+    Archived<T>: Deserialize<T, D>,
+    K: Key + Archive,
+    D: Fallible + ?Sized,
+{
+    fn deserialize(&self, deserializer: &mut D) -> Result<RodeoArchive<T, K>, D::Error> {
+        let first_key = self.first_key.to_native() as usize;
+        let strings: Vec<T> = self
+            .strings
+            .iter()
+            .map(|value| value.deserialize(deserializer))
+            .collect::<Result<_, _>>()?;
+        // Rebuild hashes from values: archived maps do not retain their input hashes.
+        let map = strings
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let key = first_key
+                    .checked_add(index)
+                    .and_then(K::try_from_usize)
+                    .expect("invalid archived key range");
+                (key, hash_value::<T, rkyv::hash::FxHasher64>(value))
+            })
+            .collect();
+        Ok(RodeoArchive {
+            first_key,
+            strings,
+            map,
+        })
+    }
 }
 
 impl<T, K> RodeoArchive<T, K>
@@ -238,6 +277,7 @@ where
     where
         S: BuildHasher,
     {
+        let first_key = rodeo.first_key;
         let strings: Vec<T> = rodeo.strings.iter().map(|s| T::from_ref(s)).collect();
 
         // Create entries with (key, hash) pairs
@@ -246,7 +286,7 @@ where
             .map
             .into_iter()
             .map(|(key, _)| {
-                let string = &strings[key.into_usize()];
+                let string = &strings[key.into_usize() - first_key];
                 let hash = hash_value::<T, rkyv::hash::FxHasher64>(string);
                 (key, hash)
             })
@@ -255,6 +295,7 @@ where
         entries.sort_by_key(|(key, _)| key.into_usize());
 
         Self {
+            first_key,
             strings,
             map: entries,
         }
@@ -268,6 +309,7 @@ where
     where
         S: BuildHasher,
     {
+        let first_key = reader.first_key;
         let strings: Vec<T> = reader.strings.iter().map(|s| T::from_ref(*s)).collect();
 
         // Create entries with (key, hash) pairs
@@ -275,7 +317,7 @@ where
             .map
             .into_iter()
             .map(|(key, _)| {
-                let string = &strings[key.into_usize()];
+                let string = &strings[key.into_usize() - first_key];
                 let hash = hash_value::<T, rkyv::hash::FxHasher64>(string);
                 (key, hash)
             })
@@ -284,6 +326,7 @@ where
         entries.sort_by_key(|(key, _)| key.into_usize());
 
         Self {
+            first_key,
             strings,
             map: entries,
         }
@@ -350,7 +393,9 @@ where
     S: BuildHasher,
 {
     fn eq(&self, other: &RodeoReader<T, K, S>) -> bool {
-        if self.strings.len() != other.strings.len() {
+        if self.first_key.to_native() as usize != other.first_key
+            || self.strings.len() != other.strings.len()
+        {
             return false;
         }
 
@@ -407,9 +452,7 @@ where
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn lookup(&self, key: &Archived<K>) -> &<Archived<T> as ArchivedInternedRef>::Ref {
-        let index = key.into_usize();
-        assert!(index < self.strings.len(), "Key out of bounds");
-        self.strings[index].as_archived_ref()
+        self.try_lookup(key).expect("Key out of bounds")
     }
 
     /// Looks up the archived value for a key, returning `None` if it's out of bounds
@@ -418,12 +461,12 @@ where
         &self,
         key: &Archived<K>,
     ) -> Option<&<Archived<T> as ArchivedInternedRef>::Ref> {
-        let index = key.into_usize();
-        if index < self.strings.len() {
-            Some(self.strings[index].as_archived_ref())
-        } else {
-            None
-        }
+        let index = key
+            .into_usize()
+            .checked_sub(self.first_key.to_native() as usize)?;
+        self.strings
+            .get(index)
+            .map(ArchivedInternedRef::as_archived_ref)
     }
 
     /// Looks up the archived value for a key without bounds checks
@@ -431,19 +474,22 @@ where
     /// # Safety
     ///
     /// The key must be valid for the current archive
+    /// Its ID must be at least the first key ID, with their difference less than `len()`.
     #[cfg_attr(feature = "inline-more", inline)]
     pub unsafe fn lookup_unchecked(
         &self,
         key: &Archived<K>,
     ) -> &<Archived<T> as ArchivedInternedRef>::Ref {
-        let index = key.into_usize();
+        let index = key.into_usize() - self.first_key.to_native() as usize;
         unsafe { self.strings.get_unchecked(index).as_archived_ref() }
     }
 
     /// Returns `true` if the given key exists in the current archive
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn contains_key(&self, key: &Archived<K>) -> bool {
-        key.into_usize() < self.strings.len()
+        key.into_usize()
+            .checked_sub(self.first_key.to_native() as usize)
+            .is_some_and(|index| index < self.strings.len())
     }
 
     /// Gets the number of interned strings
@@ -496,12 +542,12 @@ where
         self.map
             .raw_entry()
             .from_hash(hash, |entry| {
-                let index = entry.key.into_usize();
-                if index < self.strings.len() {
-                    self.strings[index].archived_eq(val)
-                } else {
-                    false
-                }
+                entry
+                    .key
+                    .into_usize()
+                    .checked_sub(self.first_key.to_native() as usize)
+                    .and_then(|index| self.strings.get(index))
+                    .is_some_and(|value| value.archived_eq(val))
             })
             .map(|(key, _)| *key)
     }
@@ -568,29 +614,6 @@ where
             (7, 8), // load factor
             serializer,
         )
-    }
-}
-
-impl<K, D> DeserializeWith<ArchivedHashMap<Archived<K>, ()>, Vec<(K, u64)>, D>
-    for HashMapWithHashes<K>
-where
-    K: Archive,
-    Archived<K>: Deserialize<K, D> + Key,
-    D: Fallible + ?Sized,
-{
-    #[inline]
-    fn deserialize_with(
-        field: &ArchivedHashMap<Archived<K>, ()>,
-        deserializer: &mut D,
-    ) -> Result<Vec<(K, u64)>, D::Error> {
-        let mut result = Vec::with_capacity(field.len());
-        for (k, _) in field.iter() {
-            let key = k.deserialize(deserializer)?;
-            // We don't have the original hashes when deserializing from archive
-            // This is fine since this type is primarily meant for zero-copy access
-            result.push((key, 0));
-        }
-        Ok(result)
     }
 }
 

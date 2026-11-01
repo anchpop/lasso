@@ -1,10 +1,10 @@
 use crate::{
-    rodeo::Internable,
     arenas::{AnyArena, LockfreeArena},
     hasher::RandomState,
     keys::{Key, Spur},
     reader::RodeoReader,
     resolver::RodeoResolver,
+    rodeo::Internable,
     Capacity, LassoError, LassoErrorKind, LassoResult, MemoryLimits, Rodeo,
 };
 use core::{
@@ -708,7 +708,7 @@ where
         };
 
         // Safety: No other references outside of `map` and `strings` to the interned strings exist
-        unsafe { RodeoReader::new(map, hasher, strings, AnyArena::Lockfree(self.arena)) }
+        unsafe { RodeoReader::new(map, hasher, strings, AnyArena::Lockfree(self.arena), 0) }
     }
 
     /// Consumes the current ThreadedRodeo, returning a [`RodeoResolver`] to allow contention-free access of the interner
@@ -751,6 +751,7 @@ where
             RodeoResolver::new(
                 strings.into_iter().map(|s| s.unwrap()).collect(),
                 AnyArena::Lockfree(self.arena),
+                0,
             )
         }
     }
@@ -882,6 +883,7 @@ where
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &Rodeo<T, K, S>) -> bool {
         self.strings.len() == other.strings.len()
+            && other.first_key == 0
             && other.strings.iter().enumerate().all(|(key, string)| {
                 K::try_from_usize(key)
                     .and_then(|key| self.strings.get(&key))
@@ -900,6 +902,7 @@ where
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &RodeoReader<T, K, S>) -> bool {
         self.strings.len() == other.strings.len()
+            && other.first_key == 0
             && other.strings.iter().enumerate().all(|(key, string)| {
                 K::try_from_usize(key)
                     .and_then(|key| self.strings.get(&key))
@@ -918,6 +921,7 @@ where
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &RodeoResolver<T, K>) -> bool {
         self.strings.len() == other.strings.len()
+            && other.first_key == 0
             && other.strings.iter().enumerate().all(|(key, string)| {
                 K::try_from_usize(key)
                     .and_then(|key| self.strings.get(&key))
@@ -982,18 +986,19 @@ where
         let hasher = S::default();
         let map = DashMap::with_capacity_and_hasher(capacity.strings, hasher.clone());
         let strings = DashMap::with_capacity_and_hasher(capacity.strings, hasher);
-        let mut highest = 0;
+        let next_key = deser_map.len();
         let arena = LockfreeArena::<String>::new(capacity.bytes, usize::MAX)
             .expect("failed to allocate memory for interner");
 
         for (string, key) in deser_map {
-            if key.into_usize() > highest {
-                highest = key.into_usize();
+            // Reader/resolver conversions require unique, dense, zero-based IDs.
+            if key.into_usize() >= next_key || strings.contains_key(&key) {
+                return Err(serde::de::Error::custom("invalid threaded key range"));
             }
 
             let allocated = unsafe {
                 arena
-                    .store_str::<String>(&string)
+                    .store_str(&string)
                     .expect("failed to allocate enough memory")
             };
 
@@ -1004,7 +1009,7 @@ where
         Ok(Self {
             map,
             strings,
-            key: AtomicUsize::new(highest),
+            key: AtomicUsize::new(next_key),
             arena,
         })
     }

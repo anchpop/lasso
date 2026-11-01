@@ -161,6 +161,8 @@ where
     /// The hasher of the map. This is stored outside of the map so that we can use
     /// custom hashing on the keys of the map without the map itself trying to do something else
     hasher: S,
+    /// ID assigned to the first interned value.
+    pub(crate) first_key: usize,
     /// Vec that allows `key` -> `str` resolution
     pub(crate) strings: Vec<&'static T::Ref>,
     /// The arena that holds all allocated strings
@@ -172,6 +174,11 @@ where
     T: Internable,
     K: Key,
 {
+    /// Creates an interner whose first insertion receives `first_key`.
+    pub fn with_first_key(first_key: K) -> Self {
+        Self::with_first_key_and_hasher(first_key, RandomState::new())
+    }
+
     /// Create a new Rodeo
     ///
     /// # Example
@@ -280,6 +287,13 @@ where
     K: Key,
     S: BuildHasher,
 {
+    /// Creates an interner with a custom first key and hasher.
+    pub fn with_first_key_and_hasher(first_key: K, hash_builder: S) -> Self {
+        let mut rodeo = Self::with_hasher(hash_builder);
+        rodeo.first_key = first_key.into_usize();
+        rodeo
+    }
+
     /// Creates an empty Rodeo which will use the given hasher for its internal hashmap
     ///
     /// # Example
@@ -352,6 +366,7 @@ where
         let MemoryLimits { max_memory_usage } = memory_limits;
 
         Self {
+            first_key: 0,
             map: HashMap::with_capacity_and_hasher(strings, ()),
             hasher: hash_builder,
             strings: Vec::with_capacity(strings),
@@ -419,6 +434,7 @@ where
     {
         let Self {
             map,
+            first_key,
             hasher,
             strings,
             arena,
@@ -430,14 +446,16 @@ where
         let hash = hasher.hash_one(string_slice);
 
         // Get the map's entry that the string should occupy
-        let key = match get_string_entry_mut::<T, K>(map, strings, hash, string_slice) {
+        let key = match get_string_entry_mut::<T, K>(map, strings, *first_key, hash, string_slice) {
             // The string already exists, so return its key
             RawEntryMut::Occupied(entry) => *entry.into_key(),
 
             // The string does not yet exist, so insert it and create its key
             RawEntryMut::Vacant(entry) => {
                 // Create the key from the vec's index that the string will hold
-                let key = K::try_from_usize(strings.len())
+                let key = first_key
+                    .checked_add(strings.len())
+                    .and_then(K::try_from_usize)
                     .ok_or_else(|| LassoError::new(LassoErrorKind::KeySpaceExhaustion))?;
 
                 // Allocate the string in the arena
@@ -448,7 +466,7 @@ where
                 strings.push(allocated);
 
                 // Insert the key with the hash of the string that it points to, reusing the hash we made earlier
-                insert_string::<T, K, S>(entry, strings, hasher, hash, key);
+                insert_string::<T, K, S>(entry, strings, *first_key, hasher, hash, key);
 
                 key
             }
@@ -513,6 +531,7 @@ where
     pub fn try_get_or_intern_static(&mut self, string: &'static T::Ref) -> LassoResult<K> {
         let Self {
             map,
+            first_key,
             hasher,
             strings,
             ..
@@ -522,21 +541,23 @@ where
         let hash = hasher.hash_one(string);
 
         // Get the map's entry that the string should occupy
-        let key = match get_string_entry_mut::<T, K>(map, strings, hash, string) {
+        let key = match get_string_entry_mut::<T, K>(map, strings, *first_key, hash, string) {
             // The string already exists, so return its key
             RawEntryMut::Occupied(entry) => *entry.into_key(),
 
             // The string does not yet exist, so insert it and create its key
             RawEntryMut::Vacant(entry) => {
                 // Create the key from the vec's index that the string will hold
-                let key = K::try_from_usize(strings.len())
+                let key = first_key
+                    .checked_add(strings.len())
+                    .and_then(K::try_from_usize)
                     .ok_or_else(|| LassoError::new(LassoErrorKind::KeySpaceExhaustion))?;
 
                 // Push the static string to the strings vector
                 strings.push(string);
 
                 // Insert the key with the hash of the string that it points to, reusing the hash we made earlier
-                insert_string::<T, K, S>(entry, strings, hasher, hash, key);
+                insert_string::<T, K, S>(entry, strings, *first_key, hasher, hash, key);
 
                 key
             }
@@ -576,7 +597,7 @@ where
             .from_hash(hash, |key| {
                 // Safety: The index given by `key` will be in bounds of the strings vector
                 let key_string: &T::Ref =
-                    unsafe { index_unchecked!(self.strings, key.into_usize()) };
+                    unsafe { index_unchecked!(self.strings, key.into_usize() - self.first_key) };
 
                 // Compare the requested string against the key's string
                 string_slice == key_string
@@ -613,6 +634,7 @@ where
 fn get_string_entry_mut<'a, T, K>(
     map: &'a mut ValMap<K>,
     strings: &[&T::Ref],
+    first_key: usize,
     hash: u64,
     target: &T::Ref,
 ) -> RawEntryMut<'a, K, (), ()>
@@ -622,7 +644,8 @@ where
 {
     map.raw_entry_mut().from_hash(hash, |key| {
         // Safety: The index given by `key` will be in bounds of the strings vector
-        let key_string: &T::Ref = unsafe { index_unchecked!(strings, key.into_usize()) };
+        let key_string: &T::Ref =
+            unsafe { index_unchecked!(strings, key.into_usize() - first_key) };
 
         // Compare the requested string against the key's string
         target == key_string
@@ -634,6 +657,7 @@ where
 fn insert_string<T, K, S>(
     entry: RawVacantEntryMut<K, (), ()>,
     strings: &[&'static T::Ref],
+    first_key: usize,
     hasher: &S,
     hash: u64,
     key: K,
@@ -644,7 +668,8 @@ fn insert_string<T, K, S>(
 {
     entry.insert_with_hasher(hash, key, (), |key| {
         // Safety: The index given by `key` will be in bounds of the strings vector
-        let key_string: &T::Ref = unsafe { index_unchecked!(strings, key.into_usize()) };
+        let key_string: &T::Ref =
+            unsafe { index_unchecked!(strings, key.into_usize() - first_key) };
 
         // Insert the string with the given hash
         hasher.hash_one(key_string)
@@ -675,7 +700,9 @@ where
     ///
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn contains_key(&self, key: &K) -> bool {
-        key.into_usize() < self.strings.len()
+        key.into_usize()
+            .checked_sub(self.first_key)
+            .is_some_and(|index| index < self.strings.len())
     }
 
     /// Resolves a string by its key. Only keys made by the current Rodeo may be used
@@ -697,14 +724,7 @@ where
     ///
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn resolve<'a>(&'a self, key: &K) -> &'a T::Ref {
-        // Safety: The call to get_unchecked's safety relies on the Key::into_usize impl
-        // being symmetric and the caller having not fabricated a key. If the impl is sound
-        // and symmetric, then it will succeed, as the usize used to create it is a valid
-        // index into self.strings
-        unsafe {
-            assert!(key.into_usize() < self.strings.len());
-            self.strings.get_unchecked(key.into_usize())
-        }
+        self.try_resolve(key).expect("Key out of bounds")
     }
 
     /// Resolves a string by its key, returning `None` if it's out of bounds. Only keys made by the
@@ -723,17 +743,9 @@ where
     ///
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn try_resolve<'a>(&'a self, key: &K) -> Option<&'a T::Ref> {
-        // Safety: The call to get_unchecked's safety relies on the Key::into_usize impl
-        // being symmetric and the caller having not fabricated a key. If the impl is sound
-        // and symmetric, then it will succeed, as the usize used to create it is a valid
-        // index into self.strings
-        unsafe {
-            if key.into_usize() < self.strings.len() {
-                Some(self.strings.get_unchecked(key.into_usize()))
-            } else {
-                None
-            }
-        }
+        self.strings
+            .get(key.into_usize().checked_sub(self.first_key)?)
+            .copied()
     }
 
     /// Resolves a string by its key, without bounds checks
@@ -741,6 +753,7 @@ where
     /// # Safety
     ///
     /// The key must be valid for the current interner
+    /// Its ID must be at least the first key ID, with their difference less than `len()`.
     ///
     /// # Example
     ///
@@ -757,7 +770,10 @@ where
     ///
     #[cfg_attr(feature = "inline-more", inline)]
     pub unsafe fn resolve_unchecked<'a>(&'a self, key: &K) -> &'a T::Ref {
-        unsafe { self.strings.get_unchecked(key.into_usize()) }
+        unsafe {
+            self.strings
+                .get_unchecked(key.into_usize() - self.first_key)
+        }
     }
 }
 
@@ -907,13 +923,14 @@ impl<T: Internable, K, S> Rodeo<T, K, S> {
     pub fn into_reader(self) -> RodeoReader<T, K, S> {
         let Self {
             map,
+            first_key,
             hasher,
             strings,
             arena,
         } = self;
 
         // Safety: No other references outside of `map` and `strings` to the interned strings exist
-        unsafe { RodeoReader::new(map, hasher, strings, AnyArena::Arena(arena)) }
+        unsafe { RodeoReader::new(map, hasher, strings, AnyArena::Arena(arena), first_key) }
     }
 
     /// Consumes the current Rodeo, returning a [`RodeoResolver`] to allow contention-free access of the interner
@@ -938,10 +955,15 @@ impl<T: Internable, K, S> Rodeo<T, K, S> {
     #[cfg_attr(feature = "inline-more", inline)]
     #[must_use]
     pub fn into_resolver(self) -> RodeoResolver<T, K> {
-        let Rodeo { strings, arena, .. } = self;
+        let Rodeo {
+            strings,
+            arena,
+            first_key,
+            ..
+        } = self;
 
         // Safety: No other references to the strings exist
-        unsafe { RodeoResolver::new(strings, AnyArena::Arena(arena)) }
+        unsafe { RodeoResolver::new(strings, AnyArena::Arena(arena), first_key) }
     }
 }
 
@@ -1029,27 +1051,28 @@ impl<T: Internable, K, S> Eq for Rodeo<T, K, S> {}
 impl<T: Internable, K, S> PartialEq<Self> for Rodeo<T, K, S> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &Self) -> bool {
-        self.strings == other.strings
+        self.first_key == other.first_key && self.strings == other.strings
     }
 }
 
 impl<T: Internable, K, S> PartialEq<RodeoReader<T, K, S>> for Rodeo<T, K, S> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &RodeoReader<T, K, S>) -> bool {
-        self.strings == other.strings
+        self.first_key == other.first_key && self.strings == other.strings
     }
 }
 
 impl<T: Internable, K, S> PartialEq<RodeoResolver<T, K>> for Rodeo<T, K, S> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &RodeoResolver<T, K>) -> bool {
-        self.strings == other.strings
+        self.first_key == other.first_key && self.strings == other.strings
     }
 }
 
 /// Clones all of the strings in `source` into the given arena, strings vec and string map
 fn clone_strings_into<T, K, S>(
     source: &[&T::Ref],
+    first_key: usize,
     arena: &mut Arena<T>,
     strings: &mut Vec<&'static T::Ref>,
     map: &mut ValMap<K>,
@@ -1071,11 +1094,13 @@ where
         let hash = hasher.hash_one(allocated);
 
         // Insert the allocated string into the string map
-        match get_string_entry_mut::<T, K>(map, strings, hash, allocated) {
+        match get_string_entry_mut::<T, K>(map, strings, first_key, hash, allocated) {
             RawEntryMut::Vacant(vacant) => {
-                let key = K::try_from_usize(idx)
+                let key = first_key
+                    .checked_add(idx)
+                    .and_then(K::try_from_usize)
                     .ok_or_else(|| LassoError::new(LassoErrorKind::KeySpaceExhaustion))?;
-                insert_string::<T, K, S>(vacant, strings, hasher, hash, key);
+                insert_string::<T, K, S>(vacant, strings, first_key, hasher, hash, key);
             }
 
             RawEntryMut::Occupied(_) => {
@@ -1117,10 +1142,18 @@ where
             ValMap::<K>::with_capacity_and_hasher(self.map.len(), ()),
             self.hasher.clone(),
         );
-        clone_strings_into::<T, K, S>(&self.strings, &mut arena, &mut strings, &mut map, &hasher)?;
+        clone_strings_into::<T, K, S>(
+            &self.strings,
+            self.first_key,
+            &mut arena,
+            &mut strings,
+            &mut map,
+            &hasher,
+        )?;
 
         Ok(Self {
             map,
+            first_key: self.first_key,
             hasher,
             strings,
             arena,
@@ -1136,6 +1169,7 @@ where
         // Clear the current interner
         self.clear();
         self.hasher = source.hasher.clone();
+        self.first_key = source.first_key;
 
         // Reserve capacity for the cloned-over strings
         self.strings
@@ -1152,6 +1186,7 @@ where
         // Clone the values into the target interner
         clone_strings_into::<T, K, S>(
             &source.strings,
+            source.first_key,
             &mut self.arena,
             &mut self.strings,
             &mut self.map,
@@ -1187,8 +1222,8 @@ impl<K, H> Serialize for Rodeo<String, K, H> {
     where
         S: Serializer,
     {
-        // Serialize all of self as a `Vec<String>`
-        self.strings.serialize(serializer)
+        // Keep the key origin alongside the values.
+        (self.first_key, &self.strings).serialize(serializer)
     }
 }
 
@@ -1199,68 +1234,20 @@ impl<'de, K: Key, S: BuildHasher + Default> Deserialize<'de> for Rodeo<String, K
     where
         D: Deserializer<'de>,
     {
-        let vector: Vec<String> = Vec::deserialize(deserializer)?;
-        let capacity = {
-            let total_bytes = vector.iter().map(|s| s.len()).sum::<usize>();
-            let total_bytes =
-                NonZeroUsize::new(total_bytes).unwrap_or_else(|| Capacity::default().bytes());
-
-            Capacity::new(vector.len(), total_bytes)
-        };
-
-        let hasher: S = Default::default();
-        let mut strings = Vec::with_capacity(capacity.strings);
-        let mut map = HashMap::with_capacity_and_hasher(capacity.strings, ());
-        let mut arena =
-            Arena::new(capacity.bytes, usize::MAX).expect("failed to allocate memory for interner");
-
-        for (key, string) in vector.into_iter().enumerate() {
-            let allocated = unsafe {
-                arena
-                    .store_str::<String>(&string)
-                    .expect("failed to allocate enough memory")
-            };
-
-            let hash = hasher.hash_one(allocated);
-
-            // Get the map's entry that the string should occupy
-            let entry = map.raw_entry_mut().from_hash(hash, |key: &K| {
-                // Safety: The index given by `key` will be in bounds of the strings vector
-                let key_string: &str = unsafe { index_unchecked!(strings, key.into_usize()) };
-
-                // Compare the requested string against the key's string
-                allocated == key_string
-            });
-
-            match entry {
-                RawEntryMut::Occupied(..) => {
-                    debug_assert!(false, "re-interned a key while deserializing");
-                }
-                RawEntryMut::Vacant(entry) => {
-                    // Create the key from the vec's index that the string will hold
-                    let key =
-                        K::try_from_usize(key).expect("failed to create key while deserializing");
-
-                    // Push the allocated string to the strings vector
-                    strings.push(allocated);
-
-                    // Insert the key with the hash of the string that it points to, reusing the hash we made earlier
-                    entry.insert_with_hasher(hash, key, (), |key| {
-                        let key_string: &str =
-                            unsafe { index_unchecked!(strings, key.into_usize()) };
-
-                        hasher.hash_one(key_string)
-                    });
-                }
+        let (first_key, vector): (usize, Vec<String>) = Deserialize::deserialize(deserializer)?;
+        let first_key = K::try_from_usize(first_key)
+            .ok_or_else(|| serde::de::Error::custom("invalid first key"))?;
+        let mut rodeo = Self::with_first_key_and_hasher(first_key, S::default());
+        for string in vector {
+            let previous_len = rodeo.len();
+            rodeo
+                .try_get_or_intern(string)
+                .map_err(serde::de::Error::custom)?;
+            if rodeo.len() == previous_len {
+                return Err(serde::de::Error::custom("duplicate interned value"));
             }
         }
-
-        Ok(Self {
-            map,
-            hasher,
-            strings,
-            arena,
-        })
+        Ok(rodeo)
     }
 }
 

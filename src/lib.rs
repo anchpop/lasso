@@ -434,6 +434,7 @@ extern crate alloc;
 mod util;
 mod archive;
 mod arenas;
+mod compressed;
 mod interface;
 mod keys;
 mod reader;
@@ -441,6 +442,9 @@ mod resolver;
 mod rodeo;
 
 pub use archive::{ArchivedInternedRef, ArchivedValueEq, RodeoArchive};
+pub use compressed::{
+    ArchivedCompressedRodeoResolver, CompressedElements, CompressedRodeoResolver,
+};
 pub use interface::{Interner, IntoReader, IntoReaderAndResolver, IntoResolver, Reader, Resolver};
 pub use keys::{Key, LargeSpur, MicroSpur, MiniSpur, Spur};
 pub use reader::RodeoReader;

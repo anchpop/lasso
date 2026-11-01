@@ -203,6 +203,7 @@ impl Default for MemoryLimits {
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Iter<'a, T: Internable, K> {
     iter: iter::Enumerate<slice::Iter<'a, &'a T::Ref>>,
+    first_key: usize,
     __key: PhantomData<K>,
 }
 
@@ -211,6 +212,7 @@ impl<'a, T: Internable, K> Iter<'a, T, K> {
     pub(crate) fn from_rodeo<S>(rodeo: &'a Rodeo<T, K, S>) -> Self {
         Self {
             iter: rodeo.strings.iter().enumerate(),
+            first_key: rodeo.first_key,
             __key: PhantomData,
         }
     }
@@ -219,6 +221,7 @@ impl<'a, T: Internable, K> Iter<'a, T, K> {
     pub(crate) fn from_reader<S>(rodeo: &'a RodeoReader<T, K, S>) -> Self {
         Self {
             iter: rodeo.strings.iter().enumerate(),
+            first_key: rodeo.first_key,
             __key: PhantomData,
         }
     }
@@ -227,17 +230,21 @@ impl<'a, T: Internable, K> Iter<'a, T, K> {
     pub(crate) fn from_resolver(rodeo: &'a RodeoResolver<T, K>) -> Self {
         Self {
             iter: rodeo.strings.iter().enumerate(),
+            first_key: rodeo.first_key,
             __key: PhantomData,
         }
     }
 }
 
-fn iter_element<'a, T: Internable, K>((key, string): (usize, &&'a T::Ref)) -> (K, &'a T::Ref)
+fn iter_element<'a, T: Internable, K>(
+    (key, string): (usize, &&'a T::Ref),
+    first_key: usize,
+) -> (K, &'a T::Ref)
 where
     K: Key,
 {
     (
-        K::try_from_usize(key).unwrap_or_else(|| unreachable!()),
+        K::try_from_usize(key + first_key).unwrap_or_else(|| unreachable!()),
         *string,
     )
 }
@@ -250,7 +257,9 @@ where
 
     #[cfg_attr(feature = "inline-more", inline)]
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(iter_element::<T, K>)
+        self.iter
+            .next()
+            .map(|entry| iter_element::<T, K>(entry, self.first_key))
     }
 
     #[cfg_attr(feature = "inline-more", inline)]
@@ -265,12 +274,16 @@ where
 {
     #[cfg_attr(feature = "inline-more", inline)]
     fn next_back(&mut self) -> Option<(K, &'a T::Ref)> {
-        self.iter.next_back().map(iter_element::<T, K>)
+        self.iter
+            .next_back()
+            .map(|entry| iter_element::<T, K>(entry, self.first_key))
     }
 
     #[cfg_attr(feature = "inline-more", inline)]
     fn nth_back(&mut self, n: usize) -> Option<(K, &'a T::Ref)> {
-        self.iter.nth_back(n).map(iter_element::<T, K>)
+        self.iter
+            .nth_back(n)
+            .map(|entry| iter_element::<T, K>(entry, self.first_key))
     }
 }
 

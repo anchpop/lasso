@@ -17,6 +17,8 @@ use core::{marker::PhantomData, ops::Index};
 /// [`ThreadedRodeo`]: crate::ThreadedRodeo
 #[derive(Debug)]
 pub struct RodeoResolver<T: Internable = String, K = Spur<T>> {
+    /// ID assigned to the first interned value.
+    pub(crate) first_key: usize,
     /// Vector of strings mapped to key indexes that allows key to string resolution
     pub(crate) strings: Vec<&'static T::Ref>,
     /// The arena that contains all the strings
@@ -36,10 +38,15 @@ impl<T: Internable, K> RodeoResolver<T, K> {
     /// The references inside of `strings` must be absolutely unique, meaning
     /// that no other references to those strings exist
     ///
-    pub(crate) unsafe fn new(strings: Vec<&'static T::Ref>, arena: AnyArena<T>) -> Self {
+    pub(crate) unsafe fn new(
+        strings: Vec<&'static T::Ref>,
+        arena: AnyArena<T>,
+        first_key: usize,
+    ) -> Self {
         Self {
             strings,
             __arena: arena,
+            first_key,
             __key: PhantomData,
         }
     }
@@ -70,15 +77,7 @@ impl<T: Internable, K> RodeoResolver<T, K> {
     where
         K: Key,
     {
-        // Safety: The call to get_unchecked's safety relies on the Key::into_usize impl
-        // being symmetric and the caller having not fabricated a key. If the impl is sound
-        // and symmetric, then it will succeed, as the usize used to create it is a valid
-        // index into self.strings
-        unsafe {
-            assert!(key.into_usize() < self.strings.len());
-
-            self.strings.get_unchecked(key.into_usize())
-        }
+        self.try_resolve(key).expect("Key out of bounds")
     }
 
     /// Resolves a string by its key, returning `None` if the key is out of bounds. Only keys
@@ -103,17 +102,9 @@ impl<T: Internable, K> RodeoResolver<T, K> {
     where
         K: Key,
     {
-        // Safety: The call to get_unchecked's safety relies on the Key::into_usize impl
-        // being symmetric and the caller having not fabricated a key. If the impl is sound
-        // and symmetric, then it will succeed, as the usize used to create it is a valid
-        // index into self.strings
-        unsafe {
-            if key.into_usize() < self.strings.len() {
-                Some(self.strings.get_unchecked(key.into_usize()))
-            } else {
-                None
-            }
-        }
+        self.strings
+            .get(key.into_usize().checked_sub(self.first_key)?)
+            .copied()
     }
 
     /// Resolves a string by its key without preforming bounds checks
@@ -121,6 +112,7 @@ impl<T: Internable, K> RodeoResolver<T, K> {
     /// # Safety
     ///
     /// The key must be valid for the current interner
+    /// Its ID must be at least the first key ID, with their difference less than `len()`.
     ///
     /// # Example
     ///
@@ -143,7 +135,10 @@ impl<T: Internable, K> RodeoResolver<T, K> {
     where
         K: Key,
     {
-        unsafe { self.strings.get_unchecked(key.into_usize()) }
+        unsafe {
+            self.strings
+                .get_unchecked(key.into_usize() - self.first_key)
+        }
     }
 
     /// Returns `true` if the given key exists in the current interner
@@ -168,7 +163,9 @@ impl<T: Internable, K> RodeoResolver<T, K> {
     where
         K: Key,
     {
-        key.into_usize() < self.strings.len()
+        key.into_usize()
+            .checked_sub(self.first_key)
+            .is_some_and(|index| index < self.strings.len())
     }
 
     /// Gets the number of interned strings
@@ -250,29 +247,27 @@ impl<T: Internable, K> Eq for RodeoResolver<T, K> {}
 impl<T: Internable, K> PartialEq<Self> for RodeoResolver<T, K> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &Self) -> bool {
-        self.strings == other.strings
+        self.first_key == other.first_key && self.strings == other.strings
     }
 }
 
 impl<T: Internable, K, S> PartialEq<RodeoReader<T, K, S>> for RodeoResolver<T, K> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &RodeoReader<T, K, S>) -> bool {
-        self.strings == other.strings
+        self.first_key == other.first_key && self.strings == other.strings
     }
 }
 
 impl<T: Internable, K, S> PartialEq<Rodeo<T, K, S>> for RodeoResolver<T, K> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &Rodeo<T, K, S>) -> bool {
-        self.strings == other.strings
+        self.first_key == other.first_key && self.strings == other.strings
     }
 }
 
 compile! {
     if #[feature = "serialize"] {
-        use crate::{Capacity, arenas::Arena};
         use alloc::string::String;
-        use core::num::NonZeroUsize;
         use serde::{
             de::{Deserialize, Deserializer},
             ser::{Serialize, Serializer},
@@ -287,8 +282,8 @@ impl<K> Serialize for RodeoResolver<String, K> {
     where
         S: Serializer,
     {
-        // Serialize all of self as a `Vec<String>`
-        self.strings.serialize(serializer)
+        // Keep the key origin alongside the values.
+        (self.first_key, &self.strings).serialize(serializer)
     }
 }
 
@@ -299,34 +294,7 @@ impl<'de, K: Key> Deserialize<'de> for RodeoResolver<String, K> {
     where
         D: Deserializer<'de>,
     {
-        let vector: Vec<String> = Vec::deserialize(deserializer)?;
-        let capacity = {
-            let total_bytes = vector.iter().map(|s| s.len()).sum::<usize>();
-            let total_bytes =
-                NonZeroUsize::new(total_bytes).unwrap_or_else(|| Capacity::default().bytes());
-
-            Capacity::new(vector.len(), total_bytes)
-        };
-
-        let mut strings = Vec::with_capacity(capacity.strings);
-        let mut arena = Arena::<String>::new(capacity.bytes, usize::MAX)
-            .expect("failed to allocate memory for interner");
-
-        for string in vector {
-            let allocated = unsafe {
-                arena
-                    .store_str::<String>(&string)
-                    .expect("failed to allocate enough memory")
-            };
-
-            strings.push(allocated);
-        }
-
-        Ok(Self {
-            strings,
-            __arena: AnyArena::Arena(arena),
-            __key: PhantomData,
-        })
+        Rodeo::<String, K>::deserialize(deserializer).map(Rodeo::into_resolver)
     }
 }
 

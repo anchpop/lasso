@@ -25,6 +25,7 @@ pub struct RodeoReader<T: Internable = String, K = Spur<T>, S = RandomState> {
     // `Rodeo` itself
     pub(crate) map: HashMap<K, (), ()>,
     pub(crate) hasher: S,
+    pub(crate) first_key: usize,
     pub(crate) strings: Vec<&'static T::Ref>,
     pub(crate) __arena: AnyArena<T>,
 }
@@ -42,12 +43,14 @@ impl<T: Internable, K, S> RodeoReader<T, K, S> {
         hasher: S,
         strings: Vec<&'static T::Ref>,
         arena: AnyArena<T>,
+        first_key: usize,
     ) -> Self {
         Self {
             map,
             hasher,
             strings,
             __arena: arena,
+            first_key,
         }
     }
 
@@ -83,7 +86,8 @@ impl<T: Internable, K, S> RodeoReader<T, K, S> {
         // Get the map's entry that the string should occupy
         let entry = self.map.raw_entry().from_hash(hash, |key| {
             // Safety: The index given by `key` will be in bounds of the strings vector
-            let key_string: &T::Ref = unsafe { index_unchecked!(self.strings, key.into_usize()) };
+            let key_string: &T::Ref =
+                unsafe { index_unchecked!(self.strings, key.into_usize() - self.first_key) };
 
             // Compare the requested string against the key's string
             string_slice == key_string
@@ -141,7 +145,9 @@ impl<T: Internable, K, S> RodeoReader<T, K, S> {
     where
         K: Key,
     {
-        key.into_usize() < self.strings.len()
+        key.into_usize()
+            .checked_sub(self.first_key)
+            .is_some_and(|index| index < self.strings.len())
     }
 
     /// Resolves a string by its key. Only keys made by the current Resolver or the creator
@@ -170,14 +176,7 @@ impl<T: Internable, K, S> RodeoReader<T, K, S> {
     where
         K: Key,
     {
-        // Safety: The call to get_unchecked's safety relies on the Key::into_usize impl
-        // being symmetric and the caller having not fabricated a key. If the impl is sound
-        // and symmetric, then it will succeed, as the usize used to create it is a valid
-        // index into self.strings
-        unsafe {
-            assert!(key.into_usize() < self.strings.len());
-            self.strings.get_unchecked(key.into_usize())
-        }
+        self.try_resolve(key).expect("Key out of bounds")
     }
 
     /// Resolves a string by its key, returning `None` if the key is out of bounds. Only keys
@@ -202,17 +201,9 @@ impl<T: Internable, K, S> RodeoReader<T, K, S> {
     where
         K: Key,
     {
-        // Safety: The call to get_unchecked's safety relies on the Key::into_usize impl
-        // being symmetric and the caller having not fabricated a key. If the impl is sound
-        // and symmetric, then it will succeed, as the usize used to create it is a valid
-        // index into self.strings
-        unsafe {
-            if key.into_usize() < self.strings.len() {
-                Some(self.strings.get_unchecked(key.into_usize()))
-            } else {
-                None
-            }
-        }
+        self.strings
+            .get(key.into_usize().checked_sub(self.first_key)?)
+            .copied()
     }
 
     /// Resolves a string by its key without bounds checks
@@ -220,6 +211,7 @@ impl<T: Internable, K, S> RodeoReader<T, K, S> {
     /// # Safety
     ///
     /// The key must be valid for the current Reader
+    /// Its ID must be at least the first key ID, with their difference less than `len()`.
     ///
     /// # Example
     ///
@@ -242,7 +234,10 @@ impl<T: Internable, K, S> RodeoReader<T, K, S> {
     where
         K: Key,
     {
-        unsafe { self.strings.get_unchecked(key.into_usize()) }
+        unsafe {
+            self.strings
+                .get_unchecked(key.into_usize() - self.first_key)
+        }
     }
 
     /// Gets the number of interned strings
@@ -321,12 +316,15 @@ impl<T: Internable, K, S> RodeoReader<T, K, S> {
     #[must_use]
     pub fn into_resolver(self) -> RodeoResolver<T, K> {
         let RodeoReader {
-            strings, __arena, ..
+            strings,
+            __arena,
+            first_key,
+            ..
         } = self;
 
         // Safety: The current reader no longer contains references to the strings
         // in the vec given to RodeoResolver
-        unsafe { RodeoResolver::<T, K>::new(strings, __arena) }
+        unsafe { RodeoResolver::<T, K>::new(strings, __arena, first_key) }
     }
 }
 
@@ -361,30 +359,27 @@ impl<T: Internable, K, S> Eq for RodeoReader<T, K, S> {}
 impl<T: Internable, K, S> PartialEq<Self> for RodeoReader<T, K, S> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &Self) -> bool {
-        self.strings == other.strings
+        self.first_key == other.first_key && self.strings == other.strings
     }
 }
 
 impl<T: Internable, K, S> PartialEq<RodeoResolver<T, K>> for RodeoReader<T, K, S> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &RodeoResolver<T, K>) -> bool {
-        self.strings == other.strings
+        self.first_key == other.first_key && self.strings == other.strings
     }
 }
 
 impl<T: Internable, K, S> PartialEq<Rodeo<T, K, S>> for RodeoReader<T, K, S> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn eq(&self, other: &Rodeo<T, K, S>) -> bool {
-        self.strings == other.strings
+        self.first_key == other.first_key && self.strings == other.strings
     }
 }
 
 compile! {
     if #[feature = "serialize"] {
-        use crate::{Capacity, arenas::Arena};
         use alloc::string::String;
-        use core::num::NonZeroUsize;
-        use hashbrown::hash_map::RawEntryMut;
         use serde::{
             de::{Deserialize, Deserializer},
             ser::{Serialize, Serializer},
@@ -399,8 +394,8 @@ impl<K, H> Serialize for RodeoReader<String, K, H> {
     where
         S: Serializer,
     {
-        // Serialize all of self as a `Vec<String>`
-        self.strings.serialize(serializer)
+        // Keep the key origin alongside the values.
+        (self.first_key, &self.strings).serialize(serializer)
     }
 }
 
@@ -411,68 +406,7 @@ impl<'de, K: Key, S: BuildHasher + Default> Deserialize<'de> for RodeoReader<Str
     where
         D: Deserializer<'de>,
     {
-        let vector: Vec<String> = Vec::deserialize(deserializer)?;
-        let capacity = {
-            let total_bytes = vector.iter().map(|s| s.len()).sum::<usize>();
-            let total_bytes =
-                NonZeroUsize::new(total_bytes).unwrap_or_else(|| Capacity::default().bytes());
-
-            Capacity::new(vector.len(), total_bytes)
-        };
-
-        let hasher: S = Default::default();
-        let mut strings = Vec::with_capacity(capacity.strings);
-        let mut map = HashMap::with_capacity_and_hasher(capacity.strings, ());
-        let mut arena = Arena::<String>::new(capacity.bytes, usize::MAX)
-            .expect("failed to allocate memory for interner");
-
-        for (key, string) in vector.into_iter().enumerate() {
-            let allocated = unsafe {
-                arena
-                    .store_str::<String>(&string)
-                    .expect("failed to allocate enough memory")
-            };
-
-            let hash = hasher.hash_one(allocated);
-
-            // Get the map's entry that the string should occupy
-            let entry = map.raw_entry_mut().from_hash(hash, |key: &K| {
-                // Safety: The index given by `key` will be in bounds of the strings vector
-                let key_string: &str = unsafe { index_unchecked!(strings, key.into_usize()) };
-
-                // Compare the requested string against the key's string
-                allocated == key_string
-            });
-
-            match entry {
-                RawEntryMut::Occupied(..) => {
-                    debug_assert!(false, "re-interned a key while deserializing");
-                }
-                RawEntryMut::Vacant(entry) => {
-                    // Create the key from the vec's index that the string will hold
-                    let key =
-                        K::try_from_usize(key).expect("failed to create key while deserializing");
-
-                    // Push the allocated string to the strings vector
-                    strings.push(allocated);
-
-                    // Insert the key with the hash of the string that it points to, reusing the hash we made earlier
-                    entry.insert_with_hasher(hash, key, (), |key| {
-                        let key_string: &str =
-                            unsafe { index_unchecked!(strings, key.into_usize()) };
-
-                        hasher.hash_one(key_string)
-                    });
-                }
-            }
-        }
-
-        Ok(Self {
-            map,
-            hasher,
-            strings,
-            __arena: AnyArena::Arena(arena),
-        })
+        Rodeo::<String, K, S>::deserialize(deserializer).map(Rodeo::into_reader)
     }
 }
 
