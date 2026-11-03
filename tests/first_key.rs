@@ -116,7 +116,7 @@ fn compressed_preserves_deduplicated_offset_keys() {
     let mut rodeo = Rodeo::<Vec<E>, Spur>::with_first_key(key(37));
     let elements = [
         E::try_from_usize(0).unwrap(),
-        E::try_from_usize(19).unwrap(),
+        E::try_from_usize(1_000_000).unwrap(),
     ];
     assert_eq!(rodeo.get_or_intern(elements), key(37));
     assert_eq!(rodeo.get_or_intern(elements), key(37));
@@ -139,7 +139,13 @@ fn compressed_preserves_deduplicated_offset_keys() {
         ($owner:expr) => {{
             let owner = &$owner;
             assert_eq!(owner.len(), 2);
-            assert_eq!(owner.resolve(&key(37)).collect::<Vec<_>>(), elements);
+            assert_eq!(
+                owner
+                    .resolve(&key(37))
+                    .map(|element| element.into_usize())
+                    .collect::<Vec<_>>(),
+                elements.map(Key::into_usize)
+            );
             assert_eq!(owner.resolve(&key(38)).count(), 0);
             assert_eq!(
                 owner.iter().map(|(k, _)| k).collect::<Vec<_>>(),

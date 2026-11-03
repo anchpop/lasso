@@ -7,6 +7,8 @@ use crate::{
     util::{Iter, Strings},
     Capacity, LassoError, LassoErrorKind, LassoResult, MemoryLimits,
 };
+#[cfg(all(feature = "no-std", not(feature = "serialize")))]
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::{cmp::max, hash::BuildHasher, iter::FromIterator, num::NonZeroUsize, ops::Index};
 use hashbrown::{
@@ -35,8 +37,8 @@ pub trait InternableRef {
 
     /// Returns true if this value is empty.
     fn is_empty(&self) -> bool;
-    /// Returns the raw bytes of this value.
-    fn as_bytes(&self) -> &[u8];
+    /// Returns the raw storage of this value, including any uninitialized padding.
+    fn as_bytes(&self) -> &[core::mem::MaybeUninit<u8>];
     /// Returns the number of elements.
     fn len(&self) -> usize;
     /// Returns an empty static reference to this type.
@@ -66,6 +68,95 @@ pub trait Internable: core::hash::Hash {
     fn from_ref(r: &Self::Ref) -> Self;
 }
 
+/// Opts a plain Copy value into interning with `Rodeo<Self, K>`.
+/// Implement `AsRef<Self>` by returning `self` as well.
+///
+/// ```
+/// use lasso::{ArchivedInternedRef, InternableValue, Key, Rodeo, RodeoArchive};
+/// use rkyv::{Archive, Deserialize, Serialize};
+///
+/// #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Archive, Serialize, Deserialize)]
+/// struct Gram { gram: u32, sense: Option<core::num::NonZeroU32>, reading: Option<u32> }
+/// impl AsRef<Gram> for Gram { fn as_ref(&self) -> &Self { self } }
+/// impl InternableValue for Gram {}
+/// impl ArchivedInternedRef for ArchivedGram {
+///     type Ref = Self;
+///     fn as_archived_ref(&self) -> &Self { self }
+/// }
+///
+/// #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Archive, Serialize, Deserialize)]
+/// #[rkyv(derive(Copy, Clone, Eq, PartialEq, Hash))]
+/// struct Rank(u32);
+/// // Both implementations preserve the index exactly.
+/// unsafe impl Key for Rank {
+///     fn into_usize(self) -> usize { self.0 as usize }
+///     fn try_from_usize(i: usize) -> Option<Self> { u32::try_from(i).ok().map(Self) }
+/// }
+/// unsafe impl Key for ArchivedRank {
+///     fn into_usize(self) -> usize { self.0.to_native() as usize }
+///     fn try_from_usize(i: usize) -> Option<Self> {
+///         u32::try_from(i).ok().map(|i| Self(i.into()))
+///     }
+/// }
+///
+/// let value = Gram { gram: 42, sense: None, reading: Some(7) };
+/// let mut rodeo = Rodeo::<Gram, Rank>::new();
+/// let rank = rodeo.get_or_intern(value);
+/// assert_eq!(rank, Rank(0)); // Insertion order determines rank.
+/// assert_eq!(rodeo.get_or_intern(value), rank);
+/// assert_eq!(rodeo.resolve(&rank), &value);
+/// let archive = RodeoArchive::from(rodeo);
+/// let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&archive).unwrap();
+/// let archived = rkyv::access::<rkyv::Archived<RodeoArchive<Gram, Rank>>, rkyv::rancor::Error>(&bytes).unwrap();
+/// let archived_rank = ArchivedRank::try_from_usize(rank.into_usize()).unwrap();
+/// assert_eq!(archived.lookup(&archived_rank).gram.to_native(), 42);
+/// let restored: lasso::RodeoReader<Gram, Rank> =
+///     rkyv::deserialize::<_, rkyv::rancor::Error>(archived).unwrap();
+/// assert_eq!(restored.resolve(&rank), &value);
+/// ```
+pub trait InternableValue: Copy + Eq + core::hash::Hash + AsRef<Self> + 'static {}
+
+impl<T: InternableValue> Internable for T {
+    type Ref = T;
+
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn from_ref(value: &T) -> T {
+        *value
+    }
+}
+
+impl<T: InternableValue> InternableRef for T {
+    const ALIGNMENT: usize = core::mem::align_of::<T>();
+
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn as_bytes(&self) -> &[core::mem::MaybeUninit<u8>] {
+        // Copy includes padding without requiring it to be initialized.
+        unsafe {
+            core::slice::from_raw_parts(core::ptr::from_ref(self).cast(), core::mem::size_of::<T>())
+        }
+    }
+
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn len(&self) -> usize {
+        1
+    }
+
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn empty() -> &'static Self {
+        panic!("interned values are never empty")
+    }
+
+    #[cfg_attr(feature = "inline-more", inline)]
+    unsafe fn from_raw_parts<'a>(ptr: *const u8, _count: usize) -> &'a Self {
+        unsafe { &*ptr.cast::<T>() }
+    }
+}
+
 impl Internable for String {
     type Ref = str;
 
@@ -80,8 +171,10 @@ impl InternableRef for str {
     fn is_empty(&self) -> bool {
         str::is_empty(self)
     }
-    fn as_bytes(&self) -> &[u8] {
-        str::as_bytes(self)
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn as_bytes(&self) -> &[core::mem::MaybeUninit<u8>] {
+        // MaybeUninit permits both initialized bytes and padding.
+        unsafe { core::slice::from_raw_parts(self.as_ptr().cast(), self.len()) }
     }
     fn len(&self) -> usize {
         str::len(self)
@@ -110,12 +203,10 @@ impl<T: 'static> InternableRef for [T] {
         <[T]>::is_empty(self)
     }
 
-    fn as_bytes(&self) -> &[u8] {
-        // Safety: Converting a slice of T to a slice of bytes.
-        // This is safe because we're just viewing the memory as bytes.
-        unsafe {
-            core::slice::from_raw_parts(self.as_ptr() as *const u8, core::mem::size_of_val(self))
-        }
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn as_bytes(&self) -> &[core::mem::MaybeUninit<u8>] {
+        // Copy padding without treating it as initialized bytes.
+        unsafe { core::slice::from_raw_parts(self.as_ptr().cast(), core::mem::size_of_val(self)) }
     }
 
     fn len(&self) -> usize {

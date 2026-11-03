@@ -110,7 +110,11 @@ impl<T: Internable> LockfreeArena<T> {
                 // and aligned_start is properly aligned for T::Ref
                 let allocated = unsafe { bucket.slice_mut(aligned_start) };
                 // Copy the given slice into the allocation
-                unsafe { allocated.copy_from_nonoverlapping(slice.as_ptr(), byte_len) };
+                unsafe {
+                    allocated
+                        .cast::<core::mem::MaybeUninit<u8>>()
+                        .copy_from_nonoverlapping(slice.as_ptr(), byte_len)
+                };
 
                 // Return the successfully allocated data
                 return Ok(unsafe { T::Ref::from_raw_parts(allocated, count) });

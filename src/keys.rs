@@ -517,11 +517,11 @@ macro_rules! impl_abomonation {
             $(
                 impl<T> Abomonation for $type<T> {
                     unsafe fn entomb<W: Write>(&self, write: &mut W) -> io::Result<()> {
-                        self.key.entomb(write)
+                        unsafe { self.key.entomb(write) }
                     }
 
                     unsafe fn exhume<'a, 'b>(&'a mut self, bytes: &'b mut [u8]) -> Option<&'b mut [u8]> {
-                        self.key.exhume(bytes)
+                        unsafe { self.key.exhume(bytes) }
                     }
 
                     fn extent(&self) -> usize {

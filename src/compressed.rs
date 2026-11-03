@@ -1,7 +1,8 @@
-//! Immutable, Huffman-compressed sequences of keys.
-use crate::{Key, Rodeo, RodeoReader};
+//! Immutable, Huffman-compressed sequences of values.
+use crate::{hasher::RandomState, Key, Rodeo, RodeoReader};
 use alloc::{collections::BinaryHeap, vec, vec::Vec};
-use core::{cmp::Reverse, marker::PhantomData};
+use core::{cmp::Reverse, hash::Hash, marker::PhantomData};
+use hashbrown::HashMap;
 use rkyv::{
     rend::{u16_le, u32_le},
     Archive, Deserialize, Serialize,
@@ -10,27 +11,32 @@ use rkyv::{
 const TABLE_BITS: usize = 12;
 const BLOCK: usize = 64;
 
-/// A read-only collection of key sequences, addressed by dense keys in insertion order.
+/// A read-only collection of value sequences, addressed by keys in insertion order.
 ///
 /// Created by consuming a Rodeo or RodeoReader of vectors, preserving its keys and
 /// deduplication. Resolution is lazy and allocation-free, including directly from
 /// a validated rkyv archive.
 ///
-/// Element IDs index the code tables directly, so elements should be dense keys,
-/// such as the keys of one rodeo.
+/// Values are stored once in a first-seen alphabet, built in sequence key order.
+/// The bitstream encodes dense alphabet indices. Each sequence ends at the next
+/// sequence's start, or the total bit length. Checkpoints and relative bit offsets
+/// locate sequence starts; shared canonical Huffman tables decode indices without
+/// reconstructing values or tables.
+/// Owned resolution borrows values; archived resolution borrows their archived forms.
 ///
 /// ```
-/// use lasso::{Rodeo, Key, Spur};
-/// let element = Spur::<()>::try_from_usize(42).unwrap();
-/// let mut rodeo = Rodeo::<Vec<Spur<()>>, Spur<()>>::new();
-/// let key = rodeo.get_or_intern([element, element]);
+/// use lasso::{Rodeo, Spur};
+/// let mut rodeo = Rodeo::<Vec<(u8, u16)>, Spur<()>>::new();
+/// let key = rodeo.get_or_intern([(7, 900), (7, 900)]);
 /// let resolver = rodeo.into_compressed_resolver();
-/// assert_eq!(resolver.resolve(&key).collect::<Vec<_>>(), [element, element]);
+/// assert_eq!(resolver.resolve(&key).copied().collect::<Vec<_>>(), [(7, 900); 2]);
 /// ```
 #[derive(Debug, Archive, Serialize, Deserialize)]
-pub struct CompressedRodeoResolver<K, E> {
+pub struct CompressedRodeoResolver<K, T> {
+    alphabet: Vec<T>,
     first_key: u32_le,
     bytes: Vec<u8>,
+    total_bits: u32_le,
     checkpoints: Vec<u32_le>,
     offsets: Vec<u16_le>,
     primary_symbols: Vec<u32_le>,
@@ -39,32 +45,38 @@ pub struct CompressedRodeoResolver<K, E> {
     first: Vec<u32_le>,
     counts: Vec<u32_le>,
     starts: Vec<u32_le>,
-    marker: PhantomData<(K, E)>,
+    marker: PhantomData<K>,
 }
 
-impl<K: Key, E: Key> CompressedRodeoResolver<K, E> {
-    fn from_sequences(sequences: &[&[E]], first_key: usize) -> Self {
+impl<K: Key, T: Copy + Eq + Hash> CompressedRodeoResolver<K, T> {
+    fn from_sequences(sequences: &[&[T]], first_key: usize) -> Self {
+        let mut alphabet = Vec::new();
+        let mut ids = HashMap::with_hasher(RandomState::new());
         let sequences: Vec<Vec<usize>> = sequences
             .iter()
-            .map(|sequence| sequence.iter().copied().map(Key::into_usize).collect())
+            .map(|sequence| {
+                sequence
+                    .iter()
+                    .map(|&value| {
+                        *ids.entry(value).or_insert_with(|| {
+                            let id = alphabet.len();
+                            alphabet.push(value);
+                            id
+                        })
+                    })
+                    .collect()
+            })
             .collect();
-        // END is the ID after the largest element.
-        let end = sequences
-            .iter()
-            .flatten()
-            .map(|&id| id + 1)
-            .max()
-            .unwrap_or(0);
-        let end = u32::try_from(end).expect("compressed resolver element ID exceeds u32");
-        let mut frequencies = vec![0u64; end as usize + 1];
+        let alphabet_len =
+            u32::try_from(alphabet.len()).expect("compressed resolver element ID exceeds u32");
+        let mut frequencies = vec![0u64; alphabet.len()];
         for seq in &sequences {
             for &id in seq {
                 frequencies[id] += 1;
             }
-            frequencies[end as usize] += 1;
         }
         let lengths = code_lengths(&frequencies);
-        let max = *lengths.iter().max().unwrap() as usize;
+        let max = lengths.iter().copied().max().unwrap_or(0) as usize;
         let mut counts = vec![0u32; max + 1];
         for &length in &lengths {
             counts[length as usize] += 1;
@@ -78,7 +90,7 @@ impl<K: Key, E: Key> CompressedRodeoResolver<K, E> {
             code = (code + u64::from(counts[length])) << 1;
             index += counts[length];
         }
-        let mut sorted: Vec<_> = (0..=end).collect();
+        let mut sorted: Vec<_> = (0..alphabet_len).collect();
         sorted.sort_unstable_by_key(|&symbol| (lengths[symbol as usize], symbol));
         let mut next: Vec<u64> = first.iter().map(|&n| u64::from(n)).collect();
         let mut codes = vec![0u32; lengths.len()];
@@ -107,7 +119,7 @@ impl<K: Key, E: Key> CompressedRodeoResolver<K, E> {
                 checkpoints.push(u32_le::from_native(total as u32));
             }
             offsets.push(block_offset(total, checkpoint).into());
-            for &symbol in seq.iter().chain(&[end as usize]) {
+            for &symbol in seq {
                 let length = lengths[symbol] as usize;
                 total += length as u64;
                 checked_bits(total);
@@ -124,10 +136,12 @@ impl<K: Key, E: Key> CompressedRodeoResolver<K, E> {
         }
         bytes.extend([0; 8]);
         CompressedRodeoResolver {
+            alphabet,
             first_key: u32::try_from(first_key)
                 .expect("compressed resolver first key exceeds u32")
                 .into(),
             bytes,
+            total_bits: (total as u32).into(),
             checkpoints,
             offsets,
             primary_symbols,
@@ -141,21 +155,23 @@ impl<K: Key, E: Key> CompressedRodeoResolver<K, E> {
     }
 }
 
-impl<E: Key + Eq + core::hash::Hash + Copy + 'static, K: Key, S> Rodeo<Vec<E>, K, S> {
+impl<T: Eq + Hash + Copy + 'static, K: Key, S> Rodeo<Vec<T>, K, S> {
     /// Consumes this interner into a compressed resolver, preserving its keys.
     ///
     /// Panics if a Huffman code exceeds 32 bits, total encoded bits exceed u32,
     /// an element ID does not fit in u32, or a sequence start exceeds its
     /// 64-sequence checkpoint by more than u16 bits.
-    pub fn into_compressed_resolver(self) -> CompressedRodeoResolver<K, E> {
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn into_compressed_resolver(self) -> CompressedRodeoResolver<K, T> {
         CompressedRodeoResolver::from_sequences(&self.strings, self.first_key)
     }
 }
 
-impl<E: Key + Eq + core::hash::Hash + Copy + 'static, K: Key, S> RodeoReader<Vec<E>, K, S> {
+impl<T: Eq + Hash + Copy + 'static, K: Key, S> RodeoReader<Vec<T>, K, S> {
     /// Consumes this reader into a compressed resolver, preserving its keys.
     /// Has the same format limits as [`Rodeo::into_compressed_resolver`].
-    pub fn into_compressed_resolver(self) -> CompressedRodeoResolver<K, E> {
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn into_compressed_resolver(self) -> CompressedRodeoResolver<K, T> {
         CompressedRodeoResolver::from_sequences(&self.strings, self.first_key)
     }
 }
@@ -173,6 +189,9 @@ fn block_offset(total: u64, checkpoint: u64) -> u16 {
 
 fn code_lengths(frequencies: &[u64]) -> Vec<u8> {
     let n = frequencies.len();
+    if n == 0 {
+        return Vec::new();
+    }
     let mut parents = vec![0; 2 * n];
     let mut heap: BinaryHeap<_> = frequencies
         .iter()
@@ -218,19 +237,33 @@ struct View<'a> {
 }
 
 /// A lazy, allocation-free iterator over one compressed sequence.
-/// Stops at its END symbol; dropping it does not decode the remaining elements.
+/// Stops at its end bit position; dropping it does not decode the remaining elements.
 #[derive(Debug)]
-pub struct CompressedElements<'a, E> {
-    view: View<'a>,
-    bit: u64,
-    done: bool,
-    marker: PhantomData<E>,
+pub struct CompressedElements<'a, T> {
+    decoder: Decoder<'a>,
+    alphabet: &'a [T],
 }
 
-impl<E: Key> Iterator for CompressedElements<'_, E> {
-    type Item = E;
-    fn next(&mut self) -> Option<E> {
-        if self.done {
+impl<'a, T> Iterator for CompressedElements<'a, T> {
+    type Item = &'a T;
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.decoder.next().map(|id| &self.alphabet[id])
+    }
+}
+impl<T> core::iter::FusedIterator for CompressedElements<'_, T> {}
+
+#[derive(Debug)]
+struct Decoder<'a> {
+    view: View<'a>,
+    bit: u64,
+    end: u64,
+}
+
+impl Iterator for Decoder<'_> {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        if self.bit >= self.end {
             return None;
         }
         let byte = usize::try_from(self.bit / 8).expect("compressed bit position exceeds usize");
@@ -254,61 +287,71 @@ impl<E: Key> Iterator for CompressedElements<'_, E> {
                 .to_native()
         } as usize;
         self.bit += length as u64;
-        // END is the last symbol ID.
-        if symbol == self.view.sorted.len() - 1 {
-            self.done = true;
-            None
-        } else {
-            Some(E::try_from_usize(symbol).expect("compressed element ID is invalid for key type"))
-        }
+        Some(symbol)
     }
 }
-impl<E: Key> core::iter::FusedIterator for CompressedElements<'_, E> {}
+impl core::iter::FusedIterator for Decoder<'_> {}
 
 macro_rules! resolver_methods {
-    () => {
+    ($element:ty) => {
         /// Returns the number of sequences (including an interned empty sequence).
+        #[cfg_attr(feature = "inline-more", inline)]
         pub fn len(&self) -> usize {
             self.offsets.len()
         }
         /// Returns whether there are no sequences.
+        #[cfg_attr(feature = "inline-more", inline)]
         pub fn is_empty(&self) -> bool {
             self.offsets.is_empty()
         }
         /// Returns whether the key is in bounds.
+        #[cfg_attr(feature = "inline-more", inline)]
         pub fn contains_key(&self, key: &K) -> bool {
             key.into_usize()
                 .checked_sub(self.first_key.to_native() as usize)
                 .is_some_and(|index| index < self.len())
         }
         /// Lazily resolves a sequence. Panics if the key is out of bounds.
-        pub fn resolve(&self, key: &K) -> CompressedElements<'_, E> {
+        #[cfg_attr(feature = "inline-more", inline)]
+        pub fn resolve(&self, key: &K) -> CompressedElements<'_, $element> {
             self.try_resolve(key)
                 .expect("compressed resolver key out of bounds")
         }
         /// Lazily resolves a sequence, or returns None for an out-of-bounds key.
-        pub fn try_resolve(&self, key: &K) -> Option<CompressedElements<'_, E>> {
+        #[cfg_attr(feature = "inline-more", inline)]
+        pub fn try_resolve(&self, key: &K) -> Option<CompressedElements<'_, $element>> {
             let index = key
                 .into_usize()
                 .checked_sub(self.first_key.to_native() as usize)?;
             let offset = self.offsets.get(index)?.to_native();
             Some(CompressedElements {
-                view: View {
-                    bytes: &self.bytes,
-                    primary_symbols: &self.primary_symbols,
-                    primary_lengths: &self.primary_lengths,
-                    sorted: &self.sorted,
-                    first: &self.first,
-                    counts: &self.counts,
-                    starts: &self.starts,
+                decoder: Decoder {
+                    view: View {
+                        bytes: &self.bytes,
+                        primary_symbols: &self.primary_symbols,
+                        primary_lengths: &self.primary_lengths,
+                        sorted: &self.sorted,
+                        first: &self.first,
+                        counts: &self.counts,
+                        starts: &self.starts,
+                    },
+                    bit: u64::from(self.checkpoints[index / BLOCK].to_native()) + u64::from(offset),
+                    end: self.offsets.get(index + 1).map_or(
+                        u64::from(self.total_bits.to_native()),
+                        |offset| {
+                            u64::from(self.checkpoints[(index + 1) / BLOCK].to_native())
+                                + u64::from(offset.to_native())
+                        },
+                    ),
                 },
-                bit: u64::from(self.checkpoints[index / BLOCK].to_native()) + u64::from(offset),
-                done: false,
-                marker: PhantomData,
+                alphabet: &self.alphabet,
             })
         }
         /// Visits sequences in key order without decoding their elements eagerly.
-        pub fn iter(&self) -> impl ExactSizeIterator<Item = (K, CompressedElements<'_, E>)> + '_ {
+        #[cfg_attr(feature = "inline-more", inline)]
+        pub fn iter(
+            &self,
+        ) -> impl ExactSizeIterator<Item = (K, CompressedElements<'_, $element>)> + '_ {
             (0..self.len()).map(|index| {
                 let key = K::try_from_usize(index + self.first_key.to_native() as usize)
                     .expect("compressed resolver key space exhausted");
@@ -318,30 +361,33 @@ macro_rules! resolver_methods {
         }
     };
 }
-impl<K: Key, E: Key> CompressedRodeoResolver<K, E> {
-    resolver_methods!();
+impl<K: Key, T> CompressedRodeoResolver<K, T> {
+    resolver_methods!(T);
 }
-impl<K: Key, E: Key> ArchivedCompressedRodeoResolver<K, E> {
-    resolver_methods!();
+impl<K: Key, T: Archive> ArchivedCompressedRodeoResolver<K, T> {
+    resolver_methods!(rkyv::Archived<T>);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LargeSpur, Spur};
+    use crate::Spur;
     // Deliberately implements no traits, including Archive and Debug.
     struct Marker;
     type K = Spur<Marker>;
-    type E = LargeSpur<Marker>;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
+    struct Symbol(core::num::NonZeroU32);
+    type E = Symbol;
     type Resolver = CompressedRodeoResolver<K, E>;
+
+    fn value(id: usize) -> E {
+        Symbol(core::num::NonZeroU32::new(u32::try_from(id + 1000).unwrap()).unwrap())
+    }
 
     fn build(sequences: &[Vec<usize>]) -> Resolver {
         let mut rodeo = Rodeo::<Vec<E>, K>::new();
         for sequence in sequences {
-            let sequence: Vec<E> = sequence
-                .iter()
-                .map(|&id| E::try_from_usize(id).unwrap())
-                .collect();
+            let sequence: Vec<E> = sequence.iter().copied().map(value).collect();
             let key = rodeo.get_or_intern(&sequence);
             assert_eq!(rodeo.get_or_intern(&sequence), key);
         }
@@ -375,14 +421,15 @@ mod tests {
             assert_eq!(owner.is_empty(), sequences.is_empty());
             for ((key, elements), expected) in owner.iter().zip(sequences) {
                 assert!(owner.contains_key(&key));
-                assert_eq!(elements.map(Key::into_usize).collect::<Vec<_>>(), *expected);
+                let expected: Vec<_> = expected.iter().copied().map(value).collect();
+                assert_eq!(elements.copied().collect::<Vec<_>>(), expected);
                 assert_eq!(
                     owner
                         .try_resolve(&key)
                         .unwrap()
-                        .map(Key::into_usize)
+                        .copied()
                         .collect::<Vec<_>>(),
-                    *expected
+                    expected
                 );
             }
             let missing = K::try_from_usize(sequences.len()).unwrap();
@@ -391,7 +438,12 @@ mod tests {
         }
         for ((key, elements), expected) in archived.iter().zip(sequences) {
             assert!(archived.contains_key(&key));
-            assert_eq!(elements.map(Key::into_usize).collect::<Vec<_>>(), *expected);
+            assert_eq!(
+                elements
+                    .map(|value| Symbol(value.0.to_native()))
+                    .collect::<Vec<_>>(),
+                expected.iter().copied().map(value).collect::<Vec<_>>()
+            );
         }
         let missing = K::try_from_usize(sequences.len()).unwrap();
         assert!(!archived.contains_key(&missing));
@@ -404,17 +456,46 @@ mod tests {
         roundtrip(&[]);
         roundtrip(&vec![vec![]; 130]);
         roundtrip(&[vec![0]]);
-        let resolver = roundtrip(&[vec![], vec![0, 7, 19], vec![0, 7, 19], vec![], vec![7]]);
+        let single = roundtrip(&[vec![0; 5], vec![], vec![0; 2], vec![0; 5]]);
+        assert_eq!(single.total_bits.to_native(), 7);
+        assert_eq!(single.sorted.len(), 1);
+        // Exercise adjacent empty ranges without interning deduplicating them.
+        let empty_ranges = CompressedRodeoResolver::<K, E>::from_sequences(
+            &[&[value(0)], &[], &[], &[value(0)], &[]],
+            0,
+        );
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&empty_ranges).unwrap();
+        let archived =
+            rkyv::access::<ArchivedCompressedRodeoResolver<K, E>, rkyv::rancor::Error>(&bytes)
+                .unwrap();
+        assert_eq!(
+            empty_ranges
+                .iter()
+                .map(|(_, s)| s.count())
+                .collect::<Vec<_>>(),
+            [1, 0, 0, 1, 0]
+        );
+        assert_eq!(
+            archived.iter().map(|(_, s)| s.count()).collect::<Vec<_>>(),
+            [1, 0, 0, 1, 0]
+        );
+        let resolver = roundtrip(&[vec![], vec![19, 0, 7], vec![19, 0, 7], vec![], vec![7]]);
+        assert_eq!(resolver.alphabet, [value(19), value(0), value(7)]);
         let mut elements = resolver.resolve(&K::try_from_usize(1).unwrap());
-        let start = elements.bit;
-        assert_eq!(elements.next().unwrap().into_usize(), 0);
-        assert!(elements.bit > start);
-        assert!(elements.bit < resolver.resolve(&K::try_from_usize(2).unwrap()).bit);
+        let start = elements.decoder.bit;
+        assert!(core::ptr::eq(
+            elements.next().unwrap(),
+            &resolver.alphabet[0]
+        ));
+        assert!(elements.decoder.bit > start);
+        assert!(
+            elements.decoder.bit < resolver.resolve(&K::try_from_usize(2).unwrap()).decoder.bit
+        );
         let mut empty = resolver.resolve(&K::try_from_usize(0).unwrap());
         assert!(empty.next().is_none());
-        let end = empty.bit;
+        let end = empty.decoder.bit;
         assert!(empty.next().is_none());
-        assert_eq!(empty.bit, end);
+        assert_eq!(empty.decoder.bit, end);
     }
 
     #[test]

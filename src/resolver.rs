@@ -5,6 +5,8 @@ use crate::{
     util::{Iter, Strings},
     Rodeo, RodeoReader,
 };
+#[cfg(all(feature = "no-std", not(feature = "serialize")))]
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::{marker::PhantomData, ops::Index};
 

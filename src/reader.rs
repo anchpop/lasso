@@ -7,6 +7,8 @@ use crate::{
     util::{Iter, Strings},
     Rodeo,
 };
+#[cfg(all(feature = "no-std", not(feature = "serialize")))]
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::{hash::BuildHasher, ops::Index};
 use hashbrown::HashMap;

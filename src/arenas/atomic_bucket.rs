@@ -163,9 +163,8 @@ impl<T: Internable> UniqueBucketRef<T> {
     ///
     /// # Safety
     ///
-    /// `new_length` must be less than or equal to the current capacity
-    /// and all bytes up to `new_length` must be initialized and valid
-    /// utf-8
+    /// `new_length` must be less than or equal to the current capacity.
+    /// Bytes below it contain stored values, possibly including uninitialized padding.
     #[inline]
     pub unsafe fn set_len(&mut self, new_length: usize) {
         debug_assert!(
@@ -213,10 +212,13 @@ impl<T: Internable> UniqueBucketRef<T> {
         };
 
         // Copy the data from the source into the bucket's buffer
-        unsafe { ptr.copy_from_nonoverlapping(slice.as_ptr(), slice.len()) };
+        unsafe {
+            ptr.cast::<core::mem::MaybeUninit<u8>>()
+                .copy_from_nonoverlapping(slice.as_ptr(), slice.len())
+        };
 
         // Increment the index so that the data we just added isn't overwritten
-        // Safety: All bytes are initialized and the length is <= capacity
+        // Safety: The value has been copied and the length is <= capacity.
         unsafe { self.set_len(aligned_len + slice.len()) };
 
         // Create a reference from the allocated data

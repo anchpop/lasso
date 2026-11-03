@@ -90,7 +90,8 @@ impl<T: Internable> Bucket<T> {
             let ptr = self.items.as_ptr().add(aligned_index);
 
             // Copy the data from the source into the bucket's buffer
-            ptr.copy_from_nonoverlapping(slice.as_ptr(), slice.len());
+            ptr.cast::<core::mem::MaybeUninit<u8>>()
+                .copy_from_nonoverlapping(slice.as_ptr(), slice.len());
             // Increment the index so that the data we just added isn't overwritten
             self.index = aligned_index + slice.len();
 

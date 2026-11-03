@@ -449,7 +449,7 @@ pub use interface::{Interner, IntoReader, IntoReaderAndResolver, IntoResolver, R
 pub use keys::{Key, LargeSpur, MicroSpur, MiniSpur, Spur};
 pub use reader::RodeoReader;
 pub use resolver::RodeoResolver;
-pub use rodeo::{Internable, InternableRef, Rodeo};
+pub use rodeo::{Internable, InternableRef, InternableValue, Rodeo};
 pub use util::{Capacity, Iter, LassoError, LassoErrorKind, LassoResult, MemoryLimits, Strings};
 
 compile! {
