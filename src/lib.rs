@@ -435,13 +435,19 @@ mod util;
 mod archive;
 mod arenas;
 mod compressed;
+mod compressed_reader;
 mod interface;
 mod keys;
 mod reader;
 mod resolver;
 mod rodeo;
+pub use compressed_reader::{
+    ArchivedCompressedRodeoReader, CompressedRodeoReader, Projection, ProjectionHasher,
+};
 
-pub use archive::{ArchivedInternedRef, ArchivedValueEq, RodeoArchive};
+pub use archive::{
+    ArchivedInternedRef, ArchivedResolverArchive, ArchivedValueEq, ResolverArchive, RodeoArchive,
+};
 pub use compressed::{
     ArchivedCompressedRodeoResolver, CompressedElements, CompressedRodeoResolver,
 };

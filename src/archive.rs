@@ -14,6 +14,73 @@ use rkyv::{
     Archive, Archived, Deserialize, Place, Serialize,
 };
 
+/// Archive backing a plain resolver: values and their first key, with no hash table.
+#[derive(Archive, Serialize, Debug)]
+pub struct ResolverArchive<T, K> {
+    first_key: usize,
+    values: Vec<T>,
+    marker: core::marker::PhantomData<K>,
+}
+
+impl<T: Internable, K> crate::RodeoResolver<T, K> {
+    fn archive_values(&self) -> ResolverArchive<T, K> {
+        ResolverArchive {
+            first_key: self.first_key,
+            values: self.strings.iter().map(|s| T::from_ref(*s)).collect(),
+            marker: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Internable + Archive, K> Archive for crate::RodeoResolver<T, K> {
+    type Archived = ArchivedResolverArchive<T, K>;
+    type Resolver = <ResolverArchive<T, K> as Archive>::Resolver;
+
+    fn resolve(&self, resolver: Self::Resolver, out: Place<Self::Archived>) {
+        self.archive_values().resolve(resolver, out);
+    }
+}
+
+impl<T, K, S> Serialize<S> for crate::RodeoResolver<T, K>
+where
+    T: Internable + Serialize<S>,
+    S: Fallible + Writer + Allocator + ?Sized,
+    S::Error: Source,
+{
+    fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+        self.archive_values().serialize(serializer)
+    }
+}
+
+impl<T, K, D> Deserialize<crate::RodeoResolver<T, K>, D> for ArchivedResolverArchive<T, K>
+where
+    T: Internable + Archive + AsRef<T::Ref>,
+    Archived<T>: Deserialize<T, D>,
+    K: Key,
+    D: Fallible + ?Sized,
+{
+    fn deserialize(&self, deserializer: &mut D) -> Result<crate::RodeoResolver<T, K>, D::Error> {
+        let first =
+            K::try_from_usize(self.first_key.to_native() as usize).expect("invalid first key");
+        let mut rodeo =
+            Rodeo::<T, K>::with_first_key_and_hasher(first, crate::hasher::RandomState::default());
+        for value in self.values.iter() {
+            rodeo.get_or_intern(value.deserialize(deserializer)?);
+        }
+        Ok(rodeo.into_resolver())
+    }
+}
+
+impl<T: Archive, K: Key> ArchivedResolverArchive<T, K>
+where
+    Archived<T>: ArchivedInternedRef,
+{
+    /// Resolve a key directly from the archived values.
+    pub fn resolve(&self, key: &K) -> &<Archived<T> as ArchivedInternedRef>::Ref {
+        self.values[key.into_usize() - self.first_key.to_native() as usize].as_archived_ref()
+    }
+}
+
 /// Trait for accessing the archived reference form of an interned type.
 ///
 /// This is used to access the data stored in an archived rodeo.
@@ -619,6 +686,33 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plain_resolver_archive_preserves_keys() {
+        for values in [alloc::vec![], alloc::vec!["", "bonjour", "東京"]] {
+            let first = crate::Spur::<String>::try_from_usize(17).unwrap();
+            let mut rodeo = crate::Rodeo::<String>::with_first_key_and_hasher(
+                first,
+                crate::hasher::RandomState::default(),
+            );
+            let keys: Vec<_> = values
+                .iter()
+                .map(|value| rodeo.get_or_intern(*value))
+                .collect();
+            let resolver = rodeo.into_resolver();
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&resolver).unwrap();
+            let archived =
+                rkyv::access::<rkyv::Archived<crate::RodeoResolver>, rkyv::rancor::Error>(&bytes)
+                    .unwrap();
+            let restored: crate::RodeoResolver =
+                rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).unwrap();
+            assert_eq!(restored.len(), values.len());
+            for (key, value) in keys.into_iter().zip(values) {
+                assert_eq!(archived.resolve(&key), value);
+                assert_eq!(restored.resolve(&key), value);
+            }
+        }
+    }
+
     use super::*;
     use crate::Rodeo;
     #[cfg(feature = "no-std")]

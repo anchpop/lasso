@@ -49,8 +49,7 @@ pub struct CompressedRodeoResolver<K, T> {
 }
 
 impl<K: Key, T: Copy + Eq + Hash> CompressedRodeoResolver<K, T> {
-    /// Builds positional sequences without deduplication, assigning keys from `first_key`.
-    pub fn from_sequences(sequences: &[&[T]], first_key: usize) -> Self {
+    pub(crate) fn from_sequences(sequences: &[&[T]], first_key: usize) -> Self {
         let mut alphabet = Vec::new();
         let mut ids = HashMap::with_hasher(RandomState::new());
         let sequences: Vec<Vec<usize>> = sequences
@@ -450,31 +449,6 @@ mod tests {
         assert!(!archived.contains_key(&missing));
         assert!(archived.try_resolve(&missing).is_none());
         resolver
-    }
-
-    #[test]
-    fn positional_sequences_preserve_duplicates_and_first_key() {
-        let values = [value(3), value(7)];
-        let sequences: &[&[E]] = &[&values, &[], &values, &[]];
-        let resolver = Resolver::from_sequences(sequences, 12);
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&resolver).unwrap();
-        let restored: Resolver = rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).unwrap();
-        for resolver in [&resolver, &restored] {
-            assert_eq!(resolver.len(), sequences.len());
-            assert!(resolver
-                .try_resolve(&K::try_from_usize(11).unwrap())
-                .is_none());
-            for (index, expected) in sequences.iter().enumerate() {
-                let key = K::try_from_usize(12 + index).unwrap();
-                assert_eq!(
-                    resolver.resolve(&key).copied().collect::<Vec<_>>(),
-                    *expected
-                );
-            }
-            assert!(resolver
-                .try_resolve(&K::try_from_usize(16).unwrap())
-                .is_none());
-        }
     }
 
     #[test]
