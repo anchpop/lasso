@@ -131,9 +131,9 @@ fn compressed_preserves_deduplicated_offset_keys() {
             .as_slice()
     );
     let archived =
-        rkyv::access::<ArchivedCompressedRodeoResolver<Spur, E>, rkyv::rancor::Error>(&bytes)
+        rkyv::access::<ArchivedCompressedRodeoResolver<Spur, Vec<E>>, rkyv::rancor::Error>(&bytes)
             .unwrap();
-    let restored: lasso::CompressedRodeoResolver<Spur, E> =
+    let restored: lasso::CompressedRodeoResolver<Spur, Vec<E>> =
         rkyv::deserialize::<_, rkyv::rancor::Error>(archived).unwrap();
     macro_rules! check {
         ($owner:expr) => {{

@@ -442,14 +442,16 @@ mod reader;
 mod resolver;
 mod rodeo;
 pub use compressed_reader::{
-    ArchivedCompressedRodeoReader, CompressedRodeoReader, Projection, ProjectionHasher,
+    ArchivedCompressedRodeoReader, CompressedRodeoReader, Passthrough, Projection,
+    ProjectionHasher, Splitter, Text,
 };
 
 pub use archive::{
     ArchivedInternedRef, ArchivedResolverArchive, ArchivedValueEq, ResolverArchive, RodeoArchive,
 };
 pub use compressed::{
-    ArchivedCompressedRodeoResolver, CompressedElements, CompressedRodeoResolver,
+    ArchivedCompressedRodeoResolver, ArchivedRunTable, BuildSymbolTable, CompressedElements,
+    CompressedRodeoResolver, RunTable, SymbolTable,
 };
 pub use interface::{Interner, IntoReader, IntoReaderAndResolver, IntoResolver, Reader, Resolver};
 pub use keys::{Key, LargeSpur, MicroSpur, MiniSpur, Spur};

@@ -1,6 +1,6 @@
 //! Immutable, Huffman-compressed sequences of values.
 use crate::{hasher::RandomState, Key, Rodeo, RodeoReader};
-use alloc::{collections::BinaryHeap, vec, vec::Vec};
+use alloc::{collections::BinaryHeap, string::String, vec, vec::Vec};
 use core::{cmp::Reverse, hash::Hash, marker::PhantomData};
 use hashbrown::HashMap;
 use rkyv::{
@@ -8,6 +8,85 @@ use rkyv::{
     Archive, Deserialize, Serialize,
 };
 
+/// Dense symbol lookup, shared by owned and archived tables.
+pub trait SymbolTable {
+    /// A value borrowed from the table.
+    type Item<'a>
+    where
+        Self: 'a;
+    /// Look up a dense symbol ID.
+    fn get(&self, id: usize) -> Self::Item<'_>;
+}
+
+/// Build-time storage for distinct symbols in first-seen order.
+pub trait BuildSymbolTable<V>: SymbolTable + Default {
+    /// Append a new symbol. Deduplication is handled by the builder.
+    fn push(&mut self, value: V);
+}
+
+impl<T> SymbolTable for Vec<T> {
+    type Item<'a>
+        = &'a T
+    where
+        T: 'a;
+    #[inline]
+    fn get(&self, id: usize) -> &T {
+        &self[id]
+    }
+}
+impl<T> SymbolTable for rkyv::vec::ArchivedVec<T> {
+    type Item<'a>
+        = &'a T
+    where
+        T: 'a;
+    #[inline]
+    fn get(&self, id: usize) -> &T {
+        &self[id]
+    }
+}
+impl<T: Clone> BuildSymbolTable<&T> for Vec<T> {
+    fn push(&mut self, value: &T) {
+        Vec::push(self, value.clone());
+    }
+}
+
+/// UTF-8 runs stored without per-run allocations.
+#[derive(Debug, Default, Archive, Serialize, Deserialize)]
+pub struct RunTable {
+    text: String,
+    ends: Vec<u32>,
+}
+impl BuildSymbolTable<&str> for RunTable {
+    fn push(&mut self, value: &str) {
+        self.text.push_str(value);
+        self.ends
+            .push(u32::try_from(self.text.len()).expect("run table text exceeds u32"));
+    }
+}
+impl SymbolTable for RunTable {
+    type Item<'a> = &'a str;
+    #[inline]
+    fn get(&self, id: usize) -> &str {
+        let start = if id == 0 {
+            0
+        } else {
+            self.ends[id - 1] as usize
+        };
+        &self.text[start..self.ends[id] as usize]
+    }
+}
+impl SymbolTable for ArchivedRunTable {
+    type Item<'a> = &'a str;
+    #[inline]
+    fn get(&self, id: usize) -> &str {
+        let start = if id == 0 {
+            0
+        } else {
+            self.ends[id - 1].to_native() as usize
+        };
+        &self.text.as_str()[start..self.ends[id].to_native() as usize]
+    }
+}
 const TABLE_BITS: usize = 12;
 const BLOCK: usize = 64;
 
@@ -32,8 +111,8 @@ const BLOCK: usize = 64;
 /// assert_eq!(resolver.resolve(&key).copied().collect::<Vec<_>>(), [(7, 900); 2]);
 /// ```
 #[derive(Debug, Archive, Serialize, Deserialize)]
-pub struct CompressedRodeoResolver<K, T> {
-    alphabet: Vec<T>,
+pub struct CompressedRodeoResolver<K, A> {
+    alphabet: A,
     first_key: u32_le,
     bytes: Vec<u8>,
     total_bits: u32_le,
@@ -48,28 +127,49 @@ pub struct CompressedRodeoResolver<K, T> {
     marker: PhantomData<K>,
 }
 
-impl<K: Key, T: Copy + Eq + Hash> CompressedRodeoResolver<K, T> {
+impl<K: Key, T: Clone + Eq + Hash> CompressedRodeoResolver<K, Vec<T>> {
     pub(crate) fn from_sequences(sequences: &[&[T]], first_key: usize) -> Self {
-        let mut alphabet = Vec::new();
+        Self::from_values(sequences.iter().map(|row| row.iter()), first_key)
+    }
+}
+
+impl<K: Key, A: SymbolTable> CompressedRodeoResolver<K, A> {
+    pub(crate) fn from_values<V: Copy + Eq + Hash>(
+        sequences: impl IntoIterator<Item = impl IntoIterator<Item = V>>,
+        first_key: usize,
+    ) -> Self
+    where
+        A: BuildSymbolTable<V>,
+    {
+        let mut alphabet = A::default();
         let mut ids = HashMap::with_hasher(RandomState::new());
         let sequences: Vec<Vec<usize>> = sequences
-            .iter()
+            .into_iter()
             .map(|sequence| {
                 sequence
-                    .iter()
-                    .map(|&value| {
+                    .into_iter()
+                    .map(|value| {
+                        let next = ids.len();
                         *ids.entry(value).or_insert_with(|| {
-                            let id = alphabet.len();
                             alphabet.push(value);
-                            id
+                            next
                         })
                     })
                     .collect()
             })
             .collect();
+        Self::from_ids(alphabet, ids.len(), sequences, first_key)
+    }
+
+    pub(crate) fn from_ids(
+        alphabet: A,
+        alphabet_len: usize,
+        sequences: Vec<Vec<usize>>,
+        first_key: usize,
+    ) -> Self {
         let alphabet_len =
-            u32::try_from(alphabet.len()).expect("compressed resolver element ID exceeds u32");
-        let mut frequencies = vec![0u64; alphabet.len()];
+            u32::try_from(alphabet_len).expect("compressed resolver element ID exceeds u32");
+        let mut frequencies = vec![0u64; alphabet_len as usize];
         for seq in &sequences {
             for &id in seq {
                 frequencies[id] += 1;
@@ -162,7 +262,7 @@ impl<T: Eq + Hash + Copy + 'static, K: Key, S> Rodeo<Vec<T>, K, S> {
     /// an element ID does not fit in u32, or a sequence start exceeds its
     /// 64-sequence checkpoint by more than u16 bits.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_compressed_resolver(self) -> CompressedRodeoResolver<K, T> {
+    pub fn into_compressed_resolver(self) -> CompressedRodeoResolver<K, Vec<T>> {
         CompressedRodeoResolver::from_sequences(&self.strings, self.first_key)
     }
 }
@@ -171,7 +271,7 @@ impl<T: Eq + Hash + Copy + 'static, K: Key, S> RodeoReader<Vec<T>, K, S> {
     /// Consumes this reader into a compressed resolver, preserving its keys.
     /// Has the same format limits as [`Rodeo::into_compressed_resolver`].
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_compressed_resolver(self) -> CompressedRodeoResolver<K, T> {
+    pub fn into_compressed_resolver(self) -> CompressedRodeoResolver<K, Vec<T>> {
         CompressedRodeoResolver::from_sequences(&self.strings, self.first_key)
     }
 }
@@ -239,19 +339,19 @@ struct View<'a> {
 /// A lazy, allocation-free iterator over one compressed sequence.
 /// Stops at its end bit position; dropping it does not decode the remaining elements.
 #[derive(Debug)]
-pub struct CompressedElements<'a, T> {
+pub struct CompressedElements<'a, A> {
     decoder: Decoder<'a>,
-    alphabet: &'a [T],
+    alphabet: &'a A,
 }
 
-impl<'a, T> Iterator for CompressedElements<'a, T> {
-    type Item = &'a T;
+impl<'a, A: SymbolTable> Iterator for CompressedElements<'a, A> {
+    type Item = A::Item<'a>;
     #[cfg_attr(feature = "inline-more", inline)]
     fn next(&mut self) -> Option<Self::Item> {
-        self.decoder.next().map(|id| &self.alphabet[id])
+        self.decoder.next().map(|id| self.alphabet.get(id))
     }
 }
-impl<T> core::iter::FusedIterator for CompressedElements<'_, T> {}
+impl<A: SymbolTable> core::iter::FusedIterator for CompressedElements<'_, A> {}
 
 #[derive(Debug)]
 struct Decoder<'a> {
@@ -323,7 +423,7 @@ macro_rules! resolver_methods {
             let index = key
                 .into_usize()
                 .checked_sub(self.first_key.to_native() as usize)?;
-            let offset = self.offsets.get(index)?.to_native();
+            let offset = self.offsets.as_slice().get(index)?.to_native();
             Some(CompressedElements {
                 decoder: Decoder {
                     view: View {
@@ -336,7 +436,7 @@ macro_rules! resolver_methods {
                         starts: &self.starts,
                     },
                     bit: u64::from(self.checkpoints[index / BLOCK].to_native()) + u64::from(offset),
-                    end: self.offsets.get(index + 1).map_or(
+                    end: self.offsets.as_slice().get(index + 1).map_or(
                         u64::from(self.total_bits.to_native()),
                         |offset| {
                             u64::from(self.checkpoints[(index + 1) / BLOCK].to_native())
@@ -361,11 +461,14 @@ macro_rules! resolver_methods {
         }
     };
 }
-impl<K: Key, T> CompressedRodeoResolver<K, T> {
-    resolver_methods!(T);
+impl<K: Key, A: SymbolTable> CompressedRodeoResolver<K, A> {
+    resolver_methods!(A);
 }
-impl<K: Key, T: Archive> ArchivedCompressedRodeoResolver<K, T> {
-    resolver_methods!(rkyv::Archived<T>);
+impl<K: Key, A: Archive> ArchivedCompressedRodeoResolver<K, A>
+where
+    rkyv::Archived<A>: SymbolTable,
+{
+    resolver_methods!(rkyv::Archived<A>);
 }
 
 #[cfg(test)]
@@ -378,7 +481,7 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Archive, Serialize, Deserialize)]
     struct Symbol(core::num::NonZeroU32);
     type E = Symbol;
-    type Resolver = CompressedRodeoResolver<K, E>;
+    type Resolver = CompressedRodeoResolver<K, Vec<E>>;
 
     fn value(id: usize) -> E {
         Symbol(core::num::NonZeroU32::new(u32::try_from(id + 1000).unwrap()).unwrap())
@@ -411,7 +514,7 @@ mod tests {
                 .as_slice()
         );
         let archived =
-            rkyv::access::<ArchivedCompressedRodeoResolver<K, E>, rkyv::rancor::Error>(&bytes)
+            rkyv::access::<ArchivedCompressedRodeoResolver<K, Vec<E>>, rkyv::rancor::Error>(&bytes)
                 .unwrap();
         let restored: Resolver = rkyv::deserialize::<_, rkyv::rancor::Error>(archived).unwrap();
         assert_eq!(archived.len(), sequences.len());
@@ -460,13 +563,13 @@ mod tests {
         assert_eq!(single.total_bits.to_native(), 7);
         assert_eq!(single.sorted.len(), 1);
         // Exercise adjacent empty ranges without interning deduplicating them.
-        let empty_ranges = CompressedRodeoResolver::<K, E>::from_sequences(
+        let empty_ranges = CompressedRodeoResolver::<K, Vec<E>>::from_sequences(
             &[&[value(0)], &[], &[], &[value(0)], &[]],
             0,
         );
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&empty_ranges).unwrap();
         let archived =
-            rkyv::access::<ArchivedCompressedRodeoResolver<K, E>, rkyv::rancor::Error>(&bytes)
+            rkyv::access::<ArchivedCompressedRodeoResolver<K, Vec<E>>, rkyv::rancor::Error>(&bytes)
                 .unwrap();
         assert_eq!(
             empty_ranges
