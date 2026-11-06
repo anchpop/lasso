@@ -85,16 +85,20 @@ fn archive_preserves_offset() {
                 .unwrap();
         let first = archived.get("0").unwrap();
         assert_eq!(first.into_usize(), 37);
-        assert_eq!(archived.lookup(&first), "0");
+        assert_eq!(archived.resolve(&first), "0");
+        assert_eq!(archived.iter().next(), Some((key(37), "0")));
+        assert_eq!(archived.iter().next_back(), Some((key(236), "199")));
+        assert_eq!(archived.iter().len(), 200);
+        assert!(archived.strings().eq(reader.strings()));
         assert_eq!(&archived[first], "0");
-        assert_eq!(unsafe { archived.lookup_unchecked(&first) }, "0");
+        assert_eq!(unsafe { archived.resolve_unchecked(&first) }, "0");
         assert!(archived == &reader);
         let zero: Rodeo = (0..200).map(|i| i.to_string()).collect();
         assert!(archived != &zero.into_reader());
         for id in [0, 36, 237] {
             let invalid = <rkyv::Archived<Spur> as Key>::try_from_usize(id).unwrap();
             assert!(!archived.contains_key(&invalid));
-            assert!(archived.try_lookup(&invalid).is_none());
+            assert!(archived.try_resolve(&invalid).is_none());
         }
         let restored: RodeoReader = rkyv::deserialize::<_, rkyv::rancor::Error>(archived).unwrap();
         assert_eq!(restored, reader);

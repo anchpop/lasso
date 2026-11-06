@@ -78,7 +78,7 @@ fn values_preserve_order_and_archive() {
         assert_eq!(restored.resolve(&key), value);
         let archived_key = ArchivedRank::try_from_usize(i + 37).unwrap();
         let decoded: Gram =
-            rkyv::deserialize::<_, rkyv::rancor::Error>(archived.lookup(&archived_key)).unwrap();
+            rkyv::deserialize::<_, rkyv::rancor::Error>(archived.resolve(&archived_key)).unwrap();
         assert_eq!(&decoded, value);
     }
 }

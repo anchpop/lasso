@@ -282,7 +282,7 @@ where
 ///
 /// // Access the archived data directly (zero-copy)
 /// let archived: &Archived<RodeoArchive<String>> = unsafe { rkyv::access_unchecked(&bytes[..]) };
-/// assert_eq!(archived.lookup(&key), "Hello, world!");
+/// assert_eq!(archived.resolve(&key), "Hello, world!");
 /// ```
 #[derive(Archive, Serialize, Debug)]
 pub struct RodeoArchive<T: Internable, K = Spur> {
@@ -479,7 +479,7 @@ where
 
 /// Archived version of RodeoArchive provides zero-copy access
 ///
-/// The `lookup` method returns the archived reference type, which may differ from
+/// The `resolve` method returns the archived reference type, which may differ from
 /// the original type. For example:
 /// - `String` -> `&str` (same)
 /// - `Vec<u8>` -> `&[u8]` (same)
@@ -515,16 +515,16 @@ where
     /// to_bytes_in::<_, rkyv::rancor::Error>(&archive, &mut bytes).unwrap();
     ///
     /// let archived: &Archived<RodeoArchive<String>> = unsafe { rkyv::access_unchecked(&bytes[..]) };
-    /// assert_eq!(archived.lookup(&key), "Hello, world!");
+    /// assert_eq!(archived.resolve(&key), "Hello, world!");
     /// ```
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn lookup(&self, key: &Archived<K>) -> &<Archived<T> as ArchivedInternedRef>::Ref {
-        self.try_lookup(key).expect("Key out of bounds")
+    pub fn resolve(&self, key: &Archived<K>) -> &<Archived<T> as ArchivedInternedRef>::Ref {
+        self.try_resolve(key).expect("Key out of bounds")
     }
 
     /// Looks up the archived value for a key, returning `None` if it's out of bounds
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn try_lookup(
+    pub fn try_resolve(
         &self,
         key: &Archived<K>,
     ) -> Option<&<Archived<T> as ArchivedInternedRef>::Ref> {
@@ -543,12 +543,35 @@ where
     /// The key must be valid for the current archive
     /// Its ID must be at least the first key ID, with their difference less than `len()`.
     #[cfg_attr(feature = "inline-more", inline)]
-    pub unsafe fn lookup_unchecked(
+    pub unsafe fn resolve_unchecked(
         &self,
         key: &Archived<K>,
     ) -> &<Archived<T> as ArchivedInternedRef>::Ref {
         let index = key.into_usize() - self.first_key.to_native() as usize;
         unsafe { self.strings.get_unchecked(index).as_archived_ref() }
+    }
+
+    /// Iterates over keys and borrowed archived values in insertion order.
+    pub fn iter(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (Archived<K>, &<Archived<T> as ArchivedInternedRef>::Ref)>
+           + ExactSizeIterator {
+        let first = self.first_key.to_native() as usize;
+        self.strings.iter().enumerate().map(move |(index, value)| {
+            let key =
+                Archived::<K>::try_from_usize(first + index).expect("invalid archived key range");
+            (key, value.as_archived_ref())
+        })
+    }
+
+    /// Iterates over borrowed archived values in insertion order.
+    pub fn strings(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &<Archived<T> as ArchivedInternedRef>::Ref> + ExactSizeIterator
+    {
+        self.strings
+            .iter()
+            .map(ArchivedInternedRef::as_archived_ref)
     }
 
     /// Returns `true` if the given key exists in the current archive
@@ -637,7 +660,44 @@ where
 
     #[cfg_attr(feature = "inline-more", inline)]
     fn index(&self, key: Archived<K>) -> &Self::Output {
-        self.lookup(&key)
+        self.resolve(&key)
+    }
+}
+
+impl<T, K> crate::Resolver<T, K> for ArchivedRodeoArchive<T, K>
+where
+    T: Internable + Archive,
+    Archived<T>: ArchivedInternedRef<Ref = T::Ref>,
+    K: Key + Hash + Archive<Archived = K>,
+{
+    fn resolve<'a>(&'a self, key: &K) -> &'a T::Ref {
+        self.resolve(key)
+    }
+    fn try_resolve<'a>(&'a self, key: &K) -> Option<&'a T::Ref> {
+        self.try_resolve(key)
+    }
+    unsafe fn resolve_unchecked<'a>(&'a self, key: &K) -> &'a T::Ref {
+        unsafe { self.resolve_unchecked(key) }
+    }
+    fn contains_key(&self, key: &K) -> bool {
+        self.contains_key(key)
+    }
+    fn len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<T, K> crate::Reader<T, K> for ArchivedRodeoArchive<T, K>
+where
+    T: Internable + Archive,
+    Archived<T>: ArchivedInternedRef<Ref = T::Ref> + ArchivedValueEq<T::Ref>,
+    K: Key + Hash + Archive<Archived = K>,
+{
+    fn get(&self, value: &T::Ref) -> Option<K> {
+        self.get(value)
+    }
+    fn contains(&self, value: &T::Ref) -> bool {
+        self.contains(value)
     }
 }
 
@@ -735,8 +795,8 @@ mod tests {
             unsafe { rkyv::access_unchecked(&bytes[..]) };
 
         assert_eq!(archived.len(), 2);
-        assert_eq!(archived.lookup(&hello), "Hello");
-        assert_eq!(archived.lookup(&world), "World");
+        assert_eq!(archived.resolve(&hello), "Hello");
+        assert_eq!(archived.resolve(&world), "World");
     }
 
     #[test]
@@ -783,7 +843,7 @@ mod tests {
         let archived: &Archived<RodeoArchive<String>> =
             unsafe { rkyv::access_unchecked(&bytes[..]) };
 
-        assert_eq!(archived.lookup(&key), "Test");
+        assert_eq!(archived.resolve(&key), "Test");
     }
 
     #[test]
@@ -803,8 +863,8 @@ mod tests {
             unsafe { rkyv::access_unchecked(&bytes[..]) };
 
         assert_eq!(archived.len(), 2);
-        assert_eq!(archived.lookup(&hello), "Hello");
-        assert_eq!(archived.lookup(&world), "World");
+        assert_eq!(archived.resolve(&hello), "Hello");
+        assert_eq!(archived.resolve(&world), "World");
         assert_eq!(archived.get("Hello"), Some(hello));
         assert!(archived.contains("World"));
     }
@@ -847,7 +907,7 @@ mod tests {
 
         // Verify all strings are accessible
         for (key, expected) in keys.iter().zip(greetings.iter()) {
-            assert_eq!(archived.strings.lookup(key), *expected);
+            assert_eq!(archived.strings.resolve(key), *expected);
             assert_eq!(archived.strings.get(expected), Some(*key));
         }
 

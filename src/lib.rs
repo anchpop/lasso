@@ -217,8 +217,6 @@
 //! }
 //!
 //! // To make sure we're upholding `Key`'s safety contract, let's make two small tests
-//! #[test]
-//! # fn a() {}
 //! fn value_in_range() {
 //!     let key = NicheKey::try_from_usize(0).unwrap();
 //!     assert_eq!(key.into_usize(), 0);
@@ -228,8 +226,6 @@
 //! }
 //! # value_in_range();
 //!
-//! #[test]
-//! # fn b() {}
 //! fn value_out_of_range() {
 //!     let key = NicheKey::try_from_usize(NICHE);
 //!     assert!(key.is_none());

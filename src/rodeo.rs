@@ -109,7 +109,7 @@ pub trait Internable: core::hash::Hash {
 /// let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&archive).unwrap();
 /// let archived = rkyv::access::<rkyv::Archived<RodeoArchive<Gram, Rank>>, rkyv::rancor::Error>(&bytes).unwrap();
 /// let archived_rank = ArchivedRank::try_from_usize(rank.into_usize()).unwrap();
-/// assert_eq!(archived.lookup(&archived_rank).gram.to_native(), 42);
+/// assert_eq!(archived.resolve(&archived_rank).gram.to_native(), 42);
 /// let restored: lasso::RodeoReader<Gram, Rank> =
 ///     rkyv::deserialize::<_, rkyv::rancor::Error>(archived).unwrap();
 /// assert_eq!(restored.resolve(&rank), &value);

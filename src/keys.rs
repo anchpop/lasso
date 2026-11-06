@@ -31,7 +31,7 @@ pub unsafe trait Key: Copy + Eq {
 /// [`ReadOnlyLasso`]: crate::ReadOnlyLasso
 /// [`Option`]: https://doc.rust-lang.org/std/option/enum.Option.html
 #[derive(rkyv::bytecheck::CheckBytes)]
-#[repr(C)]
+#[repr(transparent)]
 pub struct LargeSpur<T = String> {
     key: NonZeroUsize,
     _marker: PhantomData<fn() -> T>,
@@ -129,7 +129,7 @@ impl<T> Debug for LargeSpur<T> {
 /// [`ReadOnlyLasso`]: crate::ReadOnlyLasso
 /// [`Option`]: https://doc.rust-lang.org/std/option/enum.Option.html
 #[derive(rkyv::bytecheck::CheckBytes)]
-#[repr(C)]
+#[repr(transparent)]
 pub struct Spur<T = String> {
     key: NonZeroU32,
     _marker: PhantomData<fn() -> T>,
@@ -227,7 +227,7 @@ impl<T> Debug for Spur<T> {
 /// [`ReadOnlyLasso`]: crate::ReadOnlyLasso
 /// [`Option`]: https://doc.rust-lang.org/std/option/enum.Option.html
 #[derive(rkyv::bytecheck::CheckBytes)]
-#[repr(C)]
+#[repr(transparent)]
 pub struct MiniSpur<T = String> {
     key: NonZeroU16,
     _marker: PhantomData<fn() -> T>,
@@ -325,7 +325,7 @@ impl<T> Debug for MiniSpur<T> {
 /// [`ReadOnlyLasso`]: crate::ReadOnlyLasso
 /// [`Option`]: https://doc.rust-lang.org/std/option/enum.Option.html
 #[derive(rkyv::bytecheck::CheckBytes)]
-#[repr(C)]
+#[repr(transparent)]
 pub struct MicroSpur<T = String> {
     key: NonZeroU8,
     _marker: PhantomData<fn() -> T>,
@@ -566,7 +566,7 @@ macro_rules! impl_rkyv {
             use rkyv::{Archive, Deserialize, Serialize, Archived, Place, Portable, rancor::Fallible, traits::NoUndef};
 
             $(
-                // Safety: These are repr(C) structs containing NonZero types and PhantomData,
+                // Safety: These are transparent wrappers around NonZero types plus PhantomData,
                 // which have a well-defined portable representation
                 unsafe impl<T> Portable for $key<T> {}
 

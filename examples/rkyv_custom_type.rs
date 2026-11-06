@@ -67,10 +67,10 @@ fn bytes_example() {
         unsafe { rkyv::access_unchecked(&bytes[..]) };
 
     // Lookup by key - returns &[u8]
-    assert_eq!(archived.lookup(&hello_bytes), b"Hello".as_slice());
-    assert_eq!(archived.lookup(&world_bytes), b"World".as_slice());
+    assert_eq!(archived.resolve(&hello_bytes), b"Hello".as_slice());
+    assert_eq!(archived.resolve(&world_bytes), b"World".as_slice());
     assert_eq!(
-        archived.lookup(&binary_data),
+        archived.resolve(&binary_data),
         &[0x00, 0xFF, 0x42, 0x13, 0x37]
     );
 
@@ -110,9 +110,9 @@ fn int_vec_example() {
 
     // Lookup by key - returns &[ArchivedI32] (little-endian integers)
     // We can compare with native integers because ArchivedI32 implements PartialEq<i32>
-    let lookup1 = archived.lookup(&seq1);
-    let lookup2 = archived.lookup(&seq2);
-    let lookup3 = archived.lookup(&seq3);
+    let lookup1 = archived.resolve(&seq1);
+    let lookup2 = archived.resolve(&seq2);
+    let lookup3 = archived.resolve(&seq3);
 
     assert_eq!(lookup1.len(), 3);
     assert_eq!(lookup1[0], 1);
@@ -197,12 +197,12 @@ fn custom_struct_example() {
         unsafe { rkyv::access_unchecked(&bytes[..]) };
 
     // Lookup by key - returns &[ArchivedAtom]
-    let lookup1 = archived.lookup(&bigram1);
+    let lookup1 = archived.resolve(&bigram1);
     assert_eq!(lookup1.len(), 2);
     assert_eq!(lookup1[0].index, 1);
     assert_eq!(lookup1[1].index, 2);
 
-    let lookup2 = archived.lookup(&trigram);
+    let lookup2 = archived.resolve(&trigram);
     assert_eq!(lookup2.len(), 3);
 
     // Lookup by value (get) - works because we implemented ArchivedValueEq
